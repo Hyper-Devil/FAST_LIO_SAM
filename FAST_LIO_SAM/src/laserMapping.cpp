@@ -35,6 +35,9 @@
 #include <omp.h>
 #include <mutex>
 #include <math.h>
+#include <algorithm>
+#include <cctype>
+#include <limits>
 #include <thread>
 #include <fstream>
 #include <csignal>
@@ -289,6 +292,30 @@ bool useImuHeadingInitialization;
 bool useGpsElevation;             //  是否使用gps高层优化
 float gpsCovThreshold;          //   gps方向角和高度差的协方差阈值
 float poseCovThreshold;       //  位姿协方差阈值  from isam2
+string gnssCoordinateSystem;    // ENU or NED
+double gnssYawOffsetDeg;        // yaw rotation from GNSS local frame to mapping world frame
+bool gnssInvertX;
+bool gnssInvertY;
+double gnssTimeAlignWindow;
+double gnssMinVarianceXY;
+double gnssMinVarianceZ;
+double gnssFactorMinDistance;
+int gnssMinFixStatus;
+bool gnssRejectUnknownCovariance;
+bool gnssEnableVelocityCheck;
+double gnssMaxValidVelocity;
+
+bool gnss_local_to_world_inited = false;
+bool gnss_local_to_world_translation_inited = false;
+M3D R_world_from_gnss_local(Eye3d);
+V3D t_world_from_gnss_local(Zero3d);
+
+bool imu_orientation_enu_valid = false;
+Eigen::Quaterniond imu_orientation_enu_body = Eigen::Quaterniond::Identity();
+
+double last_valid_gnss_time = -1.0;
+bool has_last_valid_gnss_pos = false;
+V3D last_valid_gnss_pos = Zero3d;
 
 M3D Gnss_R_wrt_Lidar(Eye3d) ;         // gnss  与 imu 的外参
 V3D Gnss_T_wrt_Lidar(Zero3d);
@@ -298,7 +325,29 @@ GnssProcess gnss_data;
 ros::Publisher pubGnssPath ;
 nav_msgs::Path gps_path ;
 vector<double>       extrinT_Gnss2Lidar(3, 0.0);
-vector<double>       extrinR_Gnss2Lidar(9, 0.0);
+vector<double>       extrinR_Gnss2Lidar{1.0, 0.0, 0.0,
+                                         0.0, 1.0, 0.0,
+                                         0.0, 0.0, 1.0};
+
+
+inline bool use_ned_coordinate_system()
+{
+    string coordinate_system = gnssCoordinateSystem;
+    std::transform(coordinate_system.begin(), coordinate_system.end(), coordinate_system.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (coordinate_system == "NED")
+        return true;
+    if (coordinate_system != "ENU")
+    {
+        static bool warned_invalid_coordinate = false;
+        if (!warned_invalid_coordinate)
+        {
+            ROS_WARN("Invalid gnssCoordinateSystem=%s, fallback to ENU", gnssCoordinateSystem.c_str());
+            warned_invalid_coordinate = true;
+        }
+    }
+    return false;
+}
 
 
 // global map visualization radius
@@ -658,73 +707,99 @@ void addGPSFactor()
 {
     if (gnss_buffer.empty())
         return;
-    // 如果没有关键帧，或者首尾关键帧距离小于5m，不添加gps因子
+    // 如果没有关键帧，或者首尾关键帧距离太小，不添加gps因子
     if (cloudKeyPoses3D->points.empty())
         return;
     else
     {
-        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0)
+        if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < gnssFactorMinDistance)
             return;
     }
-    // 位姿协方差很小，没必要加入GPS数据进行校正
-    if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
-        return;
-    static PointType lastGPSPoint;      // 最新的gps数据
-    while (!gnss_buffer.empty())
-    {
-        // 删除当前帧0.2s之前的里程计
-        if (gnss_buffer.front().header.stamp.toSec() < lidar_end_time - 0.05)
-        {
-            gnss_buffer.pop_front();
-        }
-        // 超过当前帧0.2s之后，退出
-        else if (gnss_buffer.front().header.stamp.toSec() > lidar_end_time + 0.05)
-        {
-            break;
-        }
-        else
-        {
-            nav_msgs::Odometry thisGPS = gnss_buffer.front();
-            gnss_buffer.pop_front();
-            // GPS噪声协方差太大，不能用
-            float noise_x = thisGPS.pose.covariance[0];         //  x 方向的协方差
-            float noise_y = thisGPS.pose.covariance[7];
-            float noise_z = thisGPS.pose.covariance[14];      //   z(高层)方向的协方差
-            if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
-                continue;
-            // GPS里程计位置
-            float gps_x = thisGPS.pose.pose.position.x;
-            float gps_y = thisGPS.pose.pose.position.y;
-            float gps_z = thisGPS.pose.pose.position.z;
-            if (!useGpsElevation)           //  是否使用gps的高度
-            {
-                gps_z = transformTobeMapped[5];
-                noise_z = 0.01;
-            }
 
-            // (0,0,0)无效数据
-            if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
-                continue;
-            // 每隔5m添加一个GPS里程计
-            PointType curGPSPoint;
-            curGPSPoint.x = gps_x;
-            curGPSPoint.y = gps_y;
-            curGPSPoint.z = gps_z;
-            if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0)
-                continue;
-            else
-                lastGPSPoint = curGPSPoint;
-            // 添加GPS因子
-            gtsam::Vector Vector3(3);
-            Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
-            gtsam::noiseModel::Diagonal::shared_ptr gps_noise = gtsam::noiseModel::Diagonal::Variances(Vector3);
-            gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
-            gtSAMgraph.add(gps_factor);
-            aLoopIsClosed = true;
-            ROS_INFO("GPS Factor Added");
+    // 位姿协方差很小，没必要加入GPS数据进行校正
+    if (poseCovariance.rows() >= 5 && poseCovariance(3, 3) < poseCovThreshold && poseCovariance(4, 4) < poseCovThreshold)
+        return;
+
+    while (!gnss_buffer.empty() && gnss_buffer.front().header.stamp.toSec() < lidar_end_time - gnssTimeAlignWindow)
+    {
+        gnss_buffer.pop_front();
+    }
+
+    if (gnss_buffer.empty())
+        return;
+
+    int best_match_index = -1;
+    double best_match_dt = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < gnss_buffer.size(); ++i)
+    {
+        const double dt = gnss_buffer[i].header.stamp.toSec() - lidar_end_time;
+        if (dt > gnssTimeAlignWindow)
             break;
+        const double dt_abs = std::abs(dt);
+        if (dt_abs < best_match_dt)
+        {
+            best_match_dt = dt_abs;
+            best_match_index = static_cast<int>(i);
         }
     }
+
+    if (best_match_index < 0)
+        return;
+
+    nav_msgs::Odometry thisGPS = gnss_buffer[best_match_index];
+    gnss_buffer.erase(gnss_buffer.begin(), gnss_buffer.begin() + best_match_index + 1);
+
+    // GPS噪声协方差太大，不能用
+    float noise_x = thisGPS.pose.covariance[0];
+    float noise_y = thisGPS.pose.covariance[7];
+    float noise_z = thisGPS.pose.covariance[14];
+    if (!std::isfinite(noise_x) || !std::isfinite(noise_y) || !std::isfinite(noise_z))
+        return;
+    if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
+        return;
+    if (useGpsElevation && noise_z > gpsCovThreshold * 4.0f)
+        return;
+
+    // GPS里程计位置
+    float gps_x = thisGPS.pose.pose.position.x;
+    float gps_y = thisGPS.pose.pose.position.y;
+    float gps_z = thisGPS.pose.pose.position.z;
+    if (!std::isfinite(gps_x) || !std::isfinite(gps_y) || !std::isfinite(gps_z))
+        return;
+
+    if (!useGpsElevation)
+    {
+        gps_z = transformTobeMapped[5];
+        noise_z = static_cast<float>(gnssMinVarianceZ);
+    }
+
+    // (0,0,0)无效数据
+    if (std::abs(gps_x) < 1e-6 && std::abs(gps_y) < 1e-6)
+        return;
+
+    // 每隔一定距离添加一个GPS因子
+    static PointType lastGPSPoint;
+    static bool has_last_gps_point = false;
+    PointType curGPSPoint;
+    curGPSPoint.x = gps_x;
+    curGPSPoint.y = gps_y;
+    curGPSPoint.z = gps_z;
+    if (has_last_gps_point && pointDistance(curGPSPoint, lastGPSPoint) < gnssFactorMinDistance)
+        return;
+
+    lastGPSPoint = curGPSPoint;
+    has_last_gps_point = true;
+
+    // 添加GPS因子
+    gtsam::Vector Vector3(3);
+    Vector3 << max(static_cast<double>(noise_x), gnssMinVarianceXY),
+        max(static_cast<double>(noise_y), gnssMinVarianceXY),
+        max(static_cast<double>(noise_z), gnssMinVarianceZ);
+    gtsam::noiseModel::Diagonal::shared_ptr gps_noise = gtsam::noiseModel::Diagonal::Variances(Vector3);
+    gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+    gtSAMgraph.add(gps_factor);
+    aLoopIsClosed = true;
+    ROS_INFO("GPS Factor Added");
 }
 
 void saveKeyFramesAndFactor()
@@ -1342,6 +1417,15 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
     double timestamp = msg->header.stamp.toSec();
 
+    const double q_norm2 = msg->orientation.x * msg->orientation.x + msg->orientation.y * msg->orientation.y +
+                           msg->orientation.z * msg->orientation.z + msg->orientation.w * msg->orientation.w;
+    if (std::isfinite(q_norm2) && q_norm2 > 1e-6)
+    {
+        imu_orientation_enu_body = Eigen::Quaterniond(msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
+        imu_orientation_enu_body.normalize();
+        imu_orientation_enu_valid = true;
+    }
+
     mtx_buffer.lock();
 
     if (timestamp < last_timestamp_imu)
@@ -1359,7 +1443,23 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
 void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 {
-    //  ROS_INFO("GNSS DATA IN ");
+    if (!std::isfinite(msg_in->latitude) || !std::isfinite(msg_in->longitude) || !std::isfinite(msg_in->altitude))
+        return;
+
+    if (gnssRejectUnknownCovariance &&
+        msg_in->position_covariance_type == sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN)
+    {
+        ROS_WARN_THROTTLE(2.0, "GNSS covariance type unknown, skip this frame");
+        return;
+    }
+
+    if (msg_in->status.status < gnssMinFixStatus)
+    {
+        ROS_WARN_THROTTLE(2.0, "GNSS status=%d below threshold=%d, skip this frame",
+                          msg_in->status.status, gnssMinFixStatus);
+        return;
+    }
+
     double timestamp = msg_in->header.stamp.toSec();
 
     mtx_buffer.lock();
@@ -1387,42 +1487,133 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ; 
         gnss_inited = true ;
     }else{                               //   初始化完成
-        gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
+        gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;
 
-        Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        gnss_pose(0,3) = gnss_data.local_N ;                 //    北
-        gnss_pose(1,3) = gnss_data.local_E ;                 //     东
-        gnss_pose(2,3) = -gnss_data.local_U ;                 //    地
+        M3D R_local_from_enu = Eye3d;
+        if (use_ned_coordinate_system())
+        {
+            R_local_from_enu << 0.0, 1.0, 0.0,
+                1.0, 0.0, 0.0,
+                0.0, 0.0, -1.0;
+        }
 
-        Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
+        M3D R_gnss_local_to_world = Eye3d;
+        V3D t_gnss_local_to_world = Zero3d;
+
+        if (useImuHeadingInitialization)
+        {
+            if (!imu_orientation_enu_valid)
+            {
+                ROS_WARN_THROTTLE(2.0, "IMU ENU orientation is not ready, skip GNSS frame alignment");
+                return;
+            }
+
+            if (!gnss_local_to_world_inited)
+            {
+                const M3D R_world_body0 = state_point.rot.toRotationMatrix();
+                const M3D R_enu_body0 = imu_orientation_enu_body.toRotationMatrix();
+                const M3D R_local_body0 = R_local_from_enu * R_enu_body0;
+                R_world_from_gnss_local = R_world_body0 * R_local_body0.transpose();
+                gnss_local_to_world_inited = true;
+                ROS_INFO("GNSS-LIO heading alignment initialized from IMU orientation");
+            }
+
+            R_gnss_local_to_world = R_world_from_gnss_local;
+        }
+        else
+        {
+            // Fallback path for legacy datasets when no trustworthy ENU heading is available.
+            M3D R_yaw = Eye3d;
+            if (std::abs(gnssYawOffsetDeg) > 1e-6)
+            {
+                const double yaw_rad = gnssYawOffsetDeg * PI_M / 180.0;
+                const double c = std::cos(yaw_rad);
+                const double s = std::sin(yaw_rad);
+                R_yaw << c, -s, 0.0,
+                    s, c, 0.0,
+                    0.0, 0.0, 1.0;
+            }
+
+            M3D R_axis = Eye3d;
+            if (gnssInvertX)
+                R_axis(0, 0) = -1.0;
+            if (gnssInvertY)
+                R_axis(1, 1) = -1.0;
+            R_gnss_local_to_world = R_axis * R_yaw;
+        }
+
+        V3D local_enu(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
+        V3D local_gnss = R_local_from_enu * local_enu;
+
+        if (useImuHeadingInitialization && !gnss_local_to_world_translation_inited)
+        {
+            t_world_from_gnss_local = state_point.pos - R_gnss_local_to_world * local_gnss;
+            gnss_local_to_world_translation_inited = true;
+            ROS_INFO("GNSS-LIO translation alignment initialized");
+        }
+
+        if (useImuHeadingInitialization)
+            t_gnss_local_to_world = t_world_from_gnss_local;
+
+        V3D local_world = R_gnss_local_to_world * local_gnss + t_gnss_local_to_world;
+
+        Eigen::Isometry3d gnss_pose = Eigen::Isometry3d::Identity();
+        gnss_pose.pretranslate(local_world);
+
+        Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar);
         gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
-        gnss_pose  =  gnss_to_lidar  *  gnss_pose ;                    //  gnss 转到 lidar 系下, （当前Gnss_T_wrt_Lidar，只是一个大致的初值）
+        gnss_pose = gnss_to_lidar * gnss_pose;
+
+        M3D cov_enu = M3D::Zero();
+        cov_enu(0, 0) = max(msg_in->position_covariance[0], 1e-8);
+        cov_enu(1, 1) = max(msg_in->position_covariance[4], 1e-8);
+        cov_enu(2, 2) = max(msg_in->position_covariance[8], 1e-8);
+        M3D cov_local = R_local_from_enu * cov_enu * R_local_from_enu.transpose();
+        M3D cov_world = R_gnss_local_to_world * cov_local * R_gnss_local_to_world.transpose();
+        M3D cov_lidar = Gnss_R_wrt_Lidar * cov_world * Gnss_R_wrt_Lidar.transpose();
+
+        V3D gnss_position_lidar(gnss_pose.translation().x(), gnss_pose.translation().y(), gnss_pose.translation().z());
+        if (gnssEnableVelocityCheck && has_last_valid_gnss_pos)
+        {
+            double dt = gnss_data.time - last_valid_gnss_time;
+            if (dt > 1e-3)
+            {
+                double speed = (gnss_position_lidar - last_valid_gnss_pos).norm() / dt;
+                if (speed > gnssMaxValidVelocity)
+                {
+                    ROS_WARN_THROTTLE(2.0, "GNSS speed %.2f m/s exceeds threshold %.2f m/s, skip this frame", speed, gnssMaxValidVelocity);
+                    return;
+                }
+            }
+        }
 
         nav_msgs::Odometry gnss_data_enu ;
         // add new message to buffer:
         gnss_data_enu.header.stamp = ros::Time().fromSec(gnss_data.time);
-        gnss_data_enu.pose.pose.position.x =  gnss_pose(0,3) ;  //gnss_data.local_E ;   北
-        gnss_data_enu.pose.pose.position.y =  gnss_pose(1,3) ;  //gnss_data.local_N;    东
-        gnss_data_enu.pose.pose.position.z =  gnss_pose(2,3) ;  //  地
+        gnss_data_enu.pose.pose.position.x = gnss_position_lidar(0);
+        gnss_data_enu.pose.pose.position.y = gnss_position_lidar(1);
+        gnss_data_enu.pose.pose.position.z = gnss_position_lidar(2);
 
         gnss_data_enu.pose.pose.orientation.x =  geoQuat.x ;                //  gnss 的姿态不可观，所以姿态只用于可视化，取自imu
         gnss_data_enu.pose.pose.orientation.y =  geoQuat.y;
         gnss_data_enu.pose.pose.orientation.z =  geoQuat.z;
         gnss_data_enu.pose.pose.orientation.w =  geoQuat.w;
 
-        gnss_data_enu.pose.covariance[0] = gnss_data.pose_cov[0] ;
-        gnss_data_enu.pose.covariance[7] = gnss_data.pose_cov[1] ;
-        gnss_data_enu.pose.covariance[14] = gnss_data.pose_cov[2] ;
+        gnss_data_enu.pose.covariance[0] = max(cov_lidar(0, 0), 1e-8);
+        gnss_data_enu.pose.covariance[7] = max(cov_lidar(1, 1), 1e-8);
+        gnss_data_enu.pose.covariance[14] = max(cov_lidar(2, 2), 1e-8);
 
+        mtx_buffer.lock();
         gnss_buffer.push_back(gnss_data_enu);
+        mtx_buffer.unlock();
 
         // visial gnss path in rviz:
         msg_gnss_pose.header.frame_id = "camera_init";
         msg_gnss_pose.header.stamp = ros::Time().fromSec(gnss_data.time);
 
-        msg_gnss_pose.pose.position.x = gnss_pose(0,3) ;  
-        msg_gnss_pose.pose.position.y = gnss_pose(1,3) ;
-        msg_gnss_pose.pose.position.z = gnss_pose(2,3) ;
+        msg_gnss_pose.pose.position.x = gnss_position_lidar(0);
+        msg_gnss_pose.pose.position.y = gnss_position_lidar(1);
+        msg_gnss_pose.pose.position.z = gnss_position_lidar(2);
 
         gps_path.poses.push_back(msg_gnss_pose);
 
@@ -1435,8 +1626,12 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         thisPose6D.roll =0;
         thisPose6D.pitch = 0;
         thisPose6D.yaw = 0;
-        thisPose6D.time = lidar_end_time;
-        gnss_cloudKeyPoses6D->push_back(thisPose6D);   
+        thisPose6D.time = gnss_data.time;
+        gnss_cloudKeyPoses6D->push_back(thisPose6D);
+
+        last_valid_gnss_time = gnss_data.time;
+        last_valid_gnss_pos = gnss_position_lidar;
+        has_last_valid_gnss_pos = true;
     }
 
 
@@ -2274,12 +2469,30 @@ int main(int argc, char **argv)
 
     // gnss
     nh.param<string>("common/gnss_topic", gnss_topic,"/gps/fix");
-    nh.param<vector<double>>("mapping/extrinR_Gnss2Lidar", extrinR_Gnss2Lidar, vector<double>());
-    nh.param<vector<double>>("mapping/extrinT_Gnss2Lidar", extrinT_Gnss2Lidar, vector<double>());
-    nh.param<bool>("useImuHeadingInitialization", useImuHeadingInitialization, false);
+    nh.param<vector<double>>("mapping/extrinR_Gnss2Lidar", extrinR_Gnss2Lidar, vector<double>{1.0, 0.0, 0.0,
+                                                                                                   0.0, 1.0, 0.0,
+                                                                                                   0.0, 0.0, 1.0});
+    nh.param<vector<double>>("mapping/extrinT_Gnss2Lidar", extrinT_Gnss2Lidar, vector<double>{0.0, 0.0, 0.0});
+    nh.param<bool>("useImuHeadingInitialization", useImuHeadingInitialization, true);
     nh.param<bool>("useGpsElevation", useGpsElevation, false);
     nh.param<float>("gpsCovThreshold", gpsCovThreshold, 2.0);
     nh.param<float>("poseCovThreshold", poseCovThreshold, 25.0);
+    nh.param<string>("gnssCoordinateSystem", gnssCoordinateSystem, "ENU");
+    nh.param<double>("gnssYawOffsetDeg", gnssYawOffsetDeg, 0.0);
+    nh.param<bool>("gnssInvertX", gnssInvertX, false);
+    nh.param<bool>("gnssInvertY", gnssInvertY, false);
+    nh.param<double>("gnssTimeAlignWindow", gnssTimeAlignWindow, 0.10);
+    nh.param<double>("gnssMinVarianceXY", gnssMinVarianceXY, 0.01);
+    nh.param<double>("gnssMinVarianceZ", gnssMinVarianceZ, 0.04);
+    nh.param<double>("gnssFactorMinDistance", gnssFactorMinDistance, 1.0);
+    nh.param<int>("gnssMinFixStatus", gnssMinFixStatus, 0);
+    nh.param<bool>("gnssRejectUnknownCovariance", gnssRejectUnknownCovariance, true);
+    nh.param<bool>("gnssEnableVelocityCheck", gnssEnableVelocityCheck, true);
+    nh.param<double>("gnssMaxValidVelocity", gnssMaxValidVelocity, 60.0);
+
+    ROS_INFO("GNSS params: coordinate=%s, use_imu_heading_init=%d, yaw_offset_deg=%.3f, invert_x=%d, invert_y=%d, time_window=%.3f",
+             gnssCoordinateSystem.c_str(), useImuHeadingInitialization ? 1 : 0,
+             gnssYawOffsetDeg, gnssInvertX ? 1 : 0, gnssInvertY ? 1 : 0, gnssTimeAlignWindow);
 
 
     // Visualization
@@ -2336,6 +2549,19 @@ int main(int argc, char **argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov)); // 加速度协方差
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+
+    if (extrinT_Gnss2Lidar.size() != 3)
+    {
+        ROS_WARN("Invalid mapping/extrinT_Gnss2Lidar size=%zu, fallback to [0,0,0]", extrinT_Gnss2Lidar.size());
+        extrinT_Gnss2Lidar = vector<double>{0.0, 0.0, 0.0};
+    }
+    if (extrinR_Gnss2Lidar.size() != 9)
+    {
+        ROS_WARN("Invalid mapping/extrinR_Gnss2Lidar size=%zu, fallback to identity", extrinR_Gnss2Lidar.size());
+        extrinR_Gnss2Lidar = vector<double>{1.0, 0.0, 0.0,
+                                            0.0, 1.0, 0.0,
+                                            0.0, 0.0, 1.0};
+    }
 
     //设置gnss外参数
     Gnss_T_wrt_Lidar<<VEC_FROM_ARRAY(extrinT_Gnss2Lidar);

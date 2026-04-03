@@ -1,7 +1,7 @@
 common:
     lid_topic:  "/rslidar_points"     #"/velodyne_points"
     imu_topic:  "/imu/data"
-    gnss_topic:  "/imu/gps"         #"/imu/data"
+    gnss_topic:  "/imu/gpss"         #"/imu/data"
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
     time_offset_lidar_to_imu: 0.024263678570373447 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                   # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
@@ -29,6 +29,13 @@ mapping:
     extrinsic_R: [ 0.999717,  0.008665, -0.022155,
                -0.008814, 0.999939,  -0.006658,
               0.022096, 0.006851, 0.999733 ]
+
+    # GNSS (antenna) to LiDAR extrinsic
+    # keep identity/zero if already pre-aligned in upstream localization frame
+    extrinT_Gnss2Lidar: [ 0.0, 0.0, 0.0 ]
+    extrinR_Gnss2Lidar: [ 1.0, 0.0, 0.0,
+                          0.0, 1.0, 0.0,
+                          0.0, 0.0, 1.0 ]
     
 publish:
     path_en:  true
@@ -69,10 +76,24 @@ historyKeyframeSearchNum: 25                  # number of hostory key frames wil
 historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
 
 # GPS Settings
-useImuHeadingInitialization: true           # if using GPS data, set to "true"
-useGpsElevation: true                      # if GPS elevation is bad, set to "false"
-gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data
-poseCovThreshold: 0 #25.0                      # m^2, threshold for using GPS data  位姿协方差阈值 from isam2
+useImuHeadingInitialization: true           # align GNSS local frame to SLAM first-frame using ENU IMU heading
+useGpsElevation: true                       # RTK usually has usable elevation
+gpsCovThreshold: 0.2                        # m^2, stricter gate for RTK 值越小，过滤越严格，进图优化的 GNSS 点越少越干净，GNSS影响越弱
+poseCovThreshold: 8.0                         # 0 means always allow GPS correction by covariance gate 值越大，越不容易触发 GNSS 约束，GNSS影响越弱
+
+# GNSS robust settings (RTK + ENU)
+gnssCoordinateSystem: ENU                   # GeographicLib output for NavSatFix should be treated as ENU
+gnssYawOffsetDeg: 0.0                       # fallback only when useImuHeadingInitialization=false
+gnssInvertX: false                          # fallback only when useImuHeadingInitialization=false
+gnssInvertY: false                          # fallback only when useImuHeadingInitialization=false
+gnssTimeAlignWindow: 0.10                   # seconds, lidar-gnss nearest match window
+gnssMinVarianceXY: 0.16                    # m^2, lower bound for XY factor variance
+gnssMinVarianceZ: 0.64                      # m^2, lower bound for Z factor variance
+gnssFactorMinDistance: 5.0                 # meters, minimum spacing for GPS factors
+gnssMinFixStatus: 1                         # NavSatStatus: 0(FIX) and above
+gnssRejectUnknownCovariance: true           # skip COVARIANCE_TYPE_UNKNOWN
+gnssEnableVelocityCheck: true               # reject unrealistic GNSS jumps
+gnssMaxValidVelocity: 60.0                  # m/s
 
 
 # Visualization

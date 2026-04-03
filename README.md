@@ -51,6 +51,8 @@ catkin_make
 2. 新增累积点云发布话题 `/accumulated_map_points`：在 `camera_init` 下累积并降采样，再转换到 `body` 坐标系发布。
 3. 累积点云发布加入降采样缓存回写，避免历史点无限增长。
 4. 在预处理与激光回调链路增加 NaN 过滤，避免无效点进入特征提取与建图。
+5. GNSS 融合新增“源头对齐”：可使用 IMU(ENU) 姿态在启动阶段自动完成 `GNSS local -> SLAM world(first frame)` 旋转与平移初始化。
+6. GNSS 约束新增 YAML 可调参数，支持时间对齐窗口、协方差门控、方差下限、速度异常剔除，并提供 fallback 参数（仅在非标准数据源时使用）。
 
 ## Quick test
 
@@ -202,13 +204,61 @@ evo_traj kitti gnss_pose.txt optimized_pose.txt  -p
 
 ```shell
 # GPS Settings
-useImuHeadingInitialization: false           # if using GPS data, set to "true"
-useGpsElevation: false                      # if GPS elevation is bad, set to "false"
-gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data
-poseCovThreshold: 0 #25.0                      # m^2, threshold for using GPS data  位姿协方差阈值 from isam2
+useImuHeadingInitialization: true            # 推荐开启：用 IMU(ENU) 对齐 GNSS local 与 SLAM world
+useGpsElevation: true                        # RTK 高程可用时建议 true
+gpsCovThreshold: 0.5                         # RTK 场景推荐 0.2~1.0
+poseCovThreshold: 0                          # 0 表示不按位姿协方差抑制 GPS 因子
+
+# GNSS robust settings (RTK + ENU)
+gnssCoordinateSystem: ENU                    # NavSatFix + GeographicLib 推荐 ENU
+gnssYawOffsetDeg: 0.0                        # 仅在 useImuHeadingInitialization=false 时作为 fallback
+gnssInvertX: false                           # 仅在 useImuHeadingInitialization=false 时作为 fallback
+gnssInvertY: false                           # 仅在 useImuHeadingInitialization=false 时作为 fallback
+gnssTimeAlignWindow: 0.10                    # LiDAR-GNSS 匹配窗口，推荐 0.03~0.15
+gnssMinVarianceXY: 0.01                      # XY 因子方差下限，推荐 0.005~0.05
+gnssMinVarianceZ: 0.04                       # Z 因子方差下限，推荐 0.02~0.20
+gnssFactorMinDistance: 1.0                   # GPS 因子最小间距，推荐 0.5~2.0m
+gnssMinFixStatus: 0                          # 最低 Fix 状态，0=STATUS_FIX
+gnssRejectUnknownCovariance: true            # 拒绝未知协方差帧
+gnssEnableVelocityCheck: true                # 速度异常剔除
+gnssMaxValidVelocity: 60.0                   # 速度上限，根据车速上限设置
 ```
 
-#### 5.some fun
+#### 5.GNSS 参数对精度影响与调参方法（helios.yaml）
+
+1. 坐标系与首帧对齐（最关键）
+
+- `useImuHeadingInitialization`：影响最大。开启后，用 IMU(ENU) 姿态把 GNSS 本地坐标系对齐到 SLAM 首帧世界系，解决“GNSS 北向地图 vs SLAM 首帧地图”不一致问题。
+- `gnssCoordinateSystem`：必须与上游定义一致。`NavSatFix + GeographicLib` 通常应为 `ENU`。配置错误会导致整体旋转偏差。
+
+2. 外参误差（系统性偏差）
+
+- `mapping/extrinT_Gnss2Lidar`：GNSS 天线到 LiDAR 的平移外参（杆臂）。误差会导致轨迹平移偏差与转弯时附加误差。
+- `mapping/extrinR_Gnss2Lidar`：旋转外参。误差会把 GNSS 约束投到错误方向，导致优化轨迹持续被拉偏。
+
+3. 质量门控（稳定性）
+
+- `gpsCovThreshold`：GPS 方差门限。过小会“吃不到”GPS 因子，过大会把低质量点引入图优化。
+- `gnssMinFixStatus` 与 `gnssRejectUnknownCovariance`：保证只接入可靠 GNSS 解。
+- `gnssEnableVelocityCheck` / `gnssMaxValidVelocity`：剔除跳点，避免瞬时错误把图拉坏。
+
+4. 因子权重与频率（精度/鲁棒折中）
+
+- `gnssMinVarianceXY` / `gnssMinVarianceZ`：方差下限。太小会过度相信 GNSS，太大会削弱 GNSS 作用。
+- `gnssFactorMinDistance`：GPS 因子间距。太小计算开销大、噪声注入多；太大约束稀疏。
+- `gnssTimeAlignWindow`：LiDAR-GNSS 最近邻时间窗口。太小会错过匹配，太大可能配错帧。
+- `poseCovThreshold`：控制在位姿退化前后是否注入 GPS，`0` 表示不通过位姿协方差抑制。
+
+5. 建议调参顺序（RTK + 九轴 ENU）
+
+1) 先固定坐标系链路：`useImuHeadingInitialization=true`，`gnssCoordinateSystem=ENU`，外参先用标定值。
+2) 再做质量门控：把 `gpsCovThreshold` 调到 0.3~0.8，开启未知协方差剔除与速度检查。
+3) 再调权重：`gnssMinVarianceXY` 从 0.02 往 0.005 逐步减小，观察是否出现“被 GNSS 拉扯”。
+4) 最后调密度：`gnssFactorMinDistance` 在 0.5~2.0m 间按场景选择，车速高可适当增大。
+
+> 说明：`gnssYawOffsetDeg`、`gnssInvertX`、`gnssInvertY` 是 fallback 选项，仅建议在上游坐标语义不标准、且 `useImuHeadingInitialization=false` 时使用。
+
+#### 6.some fun
 
 when you want to see the path in the Map [satellite map](http://dict.youdao.com/w/satellite map/#keyfrom=E2Ctranslation)，you can also use [Mapviz](http://wiki.ros.org/mapviz)p  plugin . You can refer to  my [blog](https://blog.csdn.net/weixin_41281151/article/details/120630786?ops_request_misc=%257B%2522request%255Fid%2522%253A%2522165569598716782246421813%2522%252C%2522scm%2522%253A%252220140713.130102334..%2522%257D&request_id=165569598716782246421813&biz_id=0&utm_medium=distribute.pc_search_result.none-task-blog-2~all~sobaiduend~default-2-120630786-null-null.142^v17^pc_search_result_control_group,157^v15^new_3&utm_term=MAPVIZ&spm=1018.2226.3001.4187) on CSDN.
 
@@ -237,9 +287,9 @@ when you want to see the path in the Map [satellite map](http://dict.youdao.com/
 
 ## some problems:
 
-1.GNSS的经纬高噪声协方差没有转换到World系下，暂时使用latitude  longtitude 的cov noise 作为x y 向的cov nosie
+1.历史问题：GNSS经纬高噪声协方差与坐标系不一致，曾导致图优化被异常拉扯。
 
-2.应该使用的是ENU坐标系，但是使用**GeographicLib**转换后的结果得到的坐标系是NED坐标系下的，原因暂时没捋清楚，待解决。（X: E   Y: N  Z: -D ）
+2.当前改进：默认使用 `useImuHeadingInitialization=true` + `gnssCoordinateSystem=ENU`，在首帧对齐 `GNSS local -> SLAM world`，并在同一链路内完成协方差变换与质量门控。
 
 
 
