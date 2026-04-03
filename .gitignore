@@ -9,7 +9,4 @@ FAST_LIO_SAM/CMakeLists.txt
 FAST_LIO_SAM/build
 .vscode
 livox_ros_driver
-#whitelist
-
-
-
+FAST_LIO_SAM/Log/*

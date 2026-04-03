@@ -195,6 +195,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 /*back end*/
 vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样）
 vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;   // 历史所有关键帧的平面点集合（降采样）
+vector<pcl::PointCloud<PointType>::Ptr> copy_surfCloudKeyFrames;
 
 pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D(new pcl::PointCloud<PointType>());         // 历史关键帧位姿（位置）
 pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); // 历史关键帧位姿
@@ -679,24 +680,31 @@ void addOdomFactor()
  */
 void addLoopFactor()
 {
-    if (loopIndexQueue.empty())
-        return;
+    vector<pair<int, int>> localLoopIndexQueue;
+    vector<gtsam::Pose3> localLoopPoseQueue;
+    vector<gtsam::noiseModel::Diagonal::shared_ptr> localLoopNoiseQueue;
 
-    // 闭环队列
-    for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
     {
-        // 闭环边对应两帧的索引
-        int indexFrom = loopIndexQueue[i].first; //   cur
-        int indexTo = loopIndexQueue[i].second;  //    pre
-        // 闭环边的位姿变换
-        gtsam::Pose3 poseBetween = loopPoseQueue[i];
-        gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
-        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+        std::lock_guard<std::mutex> lock(mtx);
+        if (loopIndexQueue.empty())
+            return;
+
+        localLoopIndexQueue.swap(loopIndexQueue);
+        localLoopPoseQueue.swap(loopPoseQueue);
+        localLoopNoiseQueue.swap(loopNoiseQueue);
     }
 
-    loopIndexQueue.clear();
-    loopPoseQueue.clear();
-    loopNoiseQueue.clear();
+    // 闭环队列
+    for (int i = 0; i < (int)localLoopIndexQueue.size(); ++i)
+    {
+        // 闭环边对应两帧的索引
+        int indexFrom = localLoopIndexQueue[i].first; //   cur
+        int indexTo = localLoopIndexQueue[i].second;  //    pre
+        // 闭环边的位姿变换
+        gtsam::Pose3 poseBetween = localLoopPoseQueue[i];
+        gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = localLoopNoiseQueue[i];
+        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+    }
     aLoopIsClosed = true;
 }
 
@@ -841,20 +849,15 @@ void saveKeyFramesAndFactor()
     thisPose3D.x = latestEstimate.translation().x();
     thisPose3D.y = latestEstimate.translation().y();
     thisPose3D.z = latestEstimate.translation().z();
-    // 索引
-    thisPose3D.intensity = cloudKeyPoses3D->size(); //  使用intensity作为该帧点云的index
-    cloudKeyPoses3D->push_back(thisPose3D);         //  新关键帧帧放入队列中
 
     // cloudKeyPoses6D加入当前帧位姿
     thisPose6D.x = thisPose3D.x;
     thisPose6D.y = thisPose3D.y;
     thisPose6D.z = thisPose3D.z;
-    thisPose6D.intensity = thisPose3D.intensity;
     thisPose6D.roll = latestEstimate.rotation().roll();
     thisPose6D.pitch = latestEstimate.rotation().pitch();
     thisPose6D.yaw = latestEstimate.rotation().yaw();
     thisPose6D.time = lidar_end_time;
-    cloudKeyPoses6D->push_back(thisPose6D);
 
     // 位姿协方差
     poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size() - 1);
@@ -889,7 +892,17 @@ void saveKeyFramesAndFactor()
 
     // 保存特征点降采样集合
     // cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
-    surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        // 索引
+        thisPose3D.intensity = cloudKeyPoses3D->size(); //  使用intensity作为该帧点云的index
+        cloudKeyPoses3D->push_back(thisPose3D);         //  新关键帧帧放入队列中
+
+        thisPose6D.intensity = thisPose3D.intensity;
+        cloudKeyPoses6D->push_back(thisPose6D);
+
+        surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+    }
 
     updatePath(thisPose6D); //  可视化update后的path
 }
@@ -1029,7 +1042,7 @@ void loopFindNearKeyframes(pcl::PointCloud<PointType>::Ptr &nearKeyframes, const
     // 提取key索引的关键帧前后相邻若干帧的关键帧特征点集合
     nearKeyframes->clear();
     int cloudSize = copy_cloudKeyPoses6D->size();
-    auto surfcloud_keyframes_size = surfCloudKeyFrames.size() ;
+    auto surfcloud_keyframes_size = copy_surfCloudKeyFrames.size() ;
     for (int i = -searchNum; i <= searchNum; ++i)
     {
         int keyNear = key + i;
@@ -1041,7 +1054,7 @@ void loopFindNearKeyframes(pcl::PointCloud<PointType>::Ptr &nearKeyframes, const
 
         // *nearKeyframes += *transformPointCloud(cornerCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
         // 注意：cloudKeyPoses6D 存储的是 T_w_b , 而点云是lidar系下的，构建icp的submap时，需要通过外参数T_b_lidar 转换 , 参考pointBodyToWorld 的转换
-        *nearKeyframes += *transformPointCloud(surfCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]); //  fast-lio 没有进行特征提取，默认点云就是surf
+        *nearKeyframes += *transformPointCloud(copy_surfCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]); //  fast-lio 没有进行特征提取，默认点云就是surf
     }
 
     if (nearKeyframes->empty())
@@ -1059,15 +1072,15 @@ void performLoopClosure()
     ros::Time timeLaserInfoStamp = ros::Time().fromSec(lidar_end_time); //  时间戳
     string odometryFrame = "camera_init";
 
-    if (cloudKeyPoses3D->points.empty() == true)
     {
-        return;
-    }
+        std::lock_guard<std::mutex> lock(mtx);
+        if (cloudKeyPoses3D->points.empty() == true)
+            return;
 
-    mtx.lock();
-    *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
-    *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
-    mtx.unlock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        copy_surfCloudKeyFrames = surfCloudKeyFrames;
+    }
 
     // 当前关键帧索引，候选闭环匹配帧索引
     int loopKeyCur;
@@ -1142,11 +1155,12 @@ void performLoopClosure()
     std::cout << "loopNoiseQueue   =   " << noiseScore << std::endl;
 
     // 添加闭环因子需要的数据
-    mtx.lock();
-    loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
-    loopPoseQueue.push_back(poseFrom.between(poseTo));
-    loopNoiseQueue.push_back(constraintNoise);
-    mtx.unlock();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+        loopPoseQueue.push_back(poseFrom.between(poseTo));
+        loopNoiseQueue.push_back(constraintNoise);
+    }
 
     loopIndexContainer[loopKeyCur] = loopKeyPre; //   使用hash map 存储回环对
 }
