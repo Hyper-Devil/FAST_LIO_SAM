@@ -938,10 +938,16 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     pl_corn.clear();
     pl_full.clear();
 
-    pcl::PointCloud<rslidar_ros::Point> pl_orig;
+    pcl::PointCloud<RsPointXYZIRT> pl_orig;
     pcl::fromROSMsg(*msg, pl_orig);
     int plsize = pl_orig.points.size();
+  if (plsize == 0) return;
     pl_surf.reserve(plsize);
+
+  // Normalize RS timestamp into per-scan relative time in milliseconds.
+  // FAST_LIO stores per-point time in curvature as ms.
+  double ts_first = pl_orig.points[0].timestamp;
+  double ts_to_ms = 1.0;
 
     /*** These variables only works when no point timestamps given ***/
     double omega_l = 0.361 * SCAN_RATE;       // scan angular velocity
@@ -951,9 +957,34 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
     /*****************************************************************/
 
-    if (pl_orig.points[plsize - 1].time > 0)//todo check pl_orig.points[plsize - 1].time
+    double ts_span = pl_orig.points[plsize - 1].timestamp - ts_first;
+    if (ts_span > 0)
     {
         given_offset_time = true;
+      if (ts_span > 1e7)
+      {
+        ts_to_ms = 1e-6;  // ns -> ms
+      }
+      else if (ts_span > 1e4)
+      {
+        ts_to_ms = 1e-3;  // us -> ms
+      }
+      else if (ts_span > 10.0)
+      {
+        ts_to_ms = 1.0;   // ms -> ms
+      }
+      else
+      {
+        ts_to_ms = 1e3;   // s -> ms
+      }
+
+      double ts_span_ms = ts_span * ts_to_ms;
+      if (ts_span_ms < 1.0 || ts_span_ms > 500.0)
+      {
+        ROS_WARN_STREAM_THROTTLE(2.0,
+          "RS timestamp span abnormal: raw=" << ts_span << ", normalized_ms=" << ts_span_ms
+          << ". Check pointcloud timestamp unit/order.");
+      }
     }
     else
     {
@@ -992,7 +1023,14 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
             added_pt.y = pl_orig.points[i].y;
             added_pt.z = pl_orig.points[i].z;
             added_pt.intensity = pl_orig.points[i].intensity;
-            added_pt.curvature = pl_orig.points[i].time / 1000.0; // units: ms
+            if (given_offset_time)
+            {
+              added_pt.curvature = (pl_orig.points[i].timestamp - ts_first) * ts_to_ms;
+            }
+            else
+            {
+              added_pt.curvature = 0.0;
+            }
 
             if (!given_offset_time)
             {
@@ -1061,7 +1099,14 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
             added_pt.y = pl_orig.points[i].y;
             added_pt.z = pl_orig.points[i].z;
             added_pt.intensity = pl_orig.points[i].intensity;
-            added_pt.curvature = pl_orig.points[i].time / 1000.0;  // curvature unit: ms
+            if (given_offset_time)
+            {
+              added_pt.curvature = (pl_orig.points[i].timestamp - ts_first) * ts_to_ms;
+            }
+            else
+            {
+              added_pt.curvature = 0.0;
+            }
 
             if (!given_offset_time)
             {

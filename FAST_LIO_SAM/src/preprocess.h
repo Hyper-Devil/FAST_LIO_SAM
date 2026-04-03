@@ -52,22 +52,20 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(velodyne_ros::Point,
     (uint16_t, ring, ring)
 )
 
-namespace rslidar_ros {
-    struct EIGEN_ALIGN16 Point {
-        PCL_ADD_POINT4D;
-        float intensity;
-        float time;
-        uint16_t ring;
-        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    };
-}  // namespace rslidar_ros
-POINT_CLOUD_REGISTER_POINT_STRUCT(rslidar_ros::Point,
-                                  (float, x, x)
-                                  (float, y, y)
-                                  (float, z, z)
-                                  (float, intensity, curvature)
-                                  (float, time, normal_x)
-                                  (uint16_t, ring, ring)
+struct EIGEN_ALIGN16 RsPointXYZIRT {
+  PCL_ADD_POINT4D;
+  float intensity;
+  uint16_t ring = 0;
+  double timestamp = 0;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+POINT_CLOUD_REGISTER_POINT_STRUCT(RsPointXYZIRT,
+                  (float, x, x)
+                  (float, y, y)
+                  (float, z, z)
+                  (float, intensity, intensity)
+                  (uint16_t, ring, ring)
+                  (double, timestamp, timestamp)
 )
 
 namespace ouster_ros {
