@@ -1,7 +1,16 @@
 #include "preprocess.h"
+#include <cmath>
 
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+inline bool point_xyz_is_finite(float x, float y, float z)
+{
+  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+}
 
 Preprocess::Preprocess()
   :feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
@@ -99,6 +108,10 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     {
       if((msg->points[i].line < N_SCANS) && ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
       {
+        if (!point_xyz_is_finite(msg->points[i].x, msg->points[i].y, msg->points[i].z))
+        {
+          continue;
+        }
         pl_full[i].x = msg->points[i].x;
         pl_full[i].y = msg->points[i].y;
         pl_full[i].z = msg->points[i].z;
@@ -149,6 +162,10 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     {
       if((msg->points[i].line < N_SCANS) && ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
       {
+        if (!point_xyz_is_finite(msg->points[i].x, msg->points[i].y, msg->points[i].z))
+        {
+          continue;
+        }
         valid_num ++;
         if (valid_num % point_filter_num == 0)
         {
@@ -191,6 +208,10 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
     for (uint i = 0; i < plsize; i++)
     {
+      if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+      {
+        continue;
+      }
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y + pl_orig.points[i].z * pl_orig.points[i].z;
       if (range < (blind * blind)) continue;
       Eigen::Vector3d pt_vec;
@@ -242,6 +263,10 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     // printf("Pt size = %d, N_SCANS = %d\r\n", plsize, N_SCANS);
     for (int i = 0; i < pl_orig.points.size(); i++)
     {
+      if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+      {
+        continue;
+      }
       if (i % point_filter_num != 0) continue;
 
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y + pl_orig.points[i].z * pl_orig.points[i].z;
@@ -316,6 +341,10 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
       //计算时间、转换点云格式为PointType，正序遍历
       for (int i = 0; i < plsize; i++)
       {
+        if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+        {
+          continue;
+        }
         PointType added_pt;
         added_pt.normal_x = 0;
         added_pt.normal_y = 0;
@@ -385,6 +414,10 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     {
       for (int i = 0; i < plsize; i++)
       {
+        if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+        {
+          continue;
+        }
         PointType added_pt;
         // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
         
@@ -1013,6 +1046,10 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
         //计算时间、转换点云格式为PointType，正序遍历
         for (int i = 0; i < plsize; i++)
         {
+          if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+          {
+            continue;
+          }
             PointType added_pt;
             added_pt.normal_x = 0;
             added_pt.normal_y = 0;
@@ -1089,6 +1126,10 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     {
         for (int i = 0; i < plsize; i++)
         {
+          if (!point_xyz_is_finite(pl_orig.points[i].x, pl_orig.points[i].y, pl_orig.points[i].z))
+          {
+            continue;
+          }
             PointType added_pt;
             // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
 

@@ -274,6 +274,7 @@ Eigen::MatrixXd poseCovariance;
 
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap ;           //   发布最后优化的地图
+ros::Publisher pubAccumulatedMap;                //   发布累积降采样点云（body系）
 
 bool    recontructKdTree = false;
 int updateKdtreeCount = 0 ;        //  每100次更新一次
@@ -1275,6 +1276,8 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    std::vector<int> valid_idx;
+    pcl::removeNaNFromPointCloud(*ptr, *ptr, valid_idx);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(msg->header.stamp.toSec());
     last_timestamp_lidar = msg->header.stamp.toSec();
@@ -1313,6 +1316,8 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 
     // 特征提取或间隔采样
     p_pre->process(msg, ptr);
+    std::vector<int> valid_idx;
+    pcl::removeNaNFromPointCloud(*ptr, *ptr, valid_idx);
     lidar_buffer.push_back(ptr); //储存处理后的lidar特征
     time_buffer.push_back(last_timestamp_lidar);
 
@@ -1557,7 +1562,7 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
+PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    将稠密点云从 imu convert to  world
 {
@@ -1580,6 +1585,55 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
         laserCloudmsg.header.frame_id = "camera_init";
         pubLaserCloudFull.publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
+    }
+
+    if (pubAccumulatedMap.getNumSubscribers() > 0)
+    {
+        int size = feats_undistort->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++)
+        {
+            RGBpointBodyToWorld(&feats_undistort->points[i],
+                                &laserCloudWorld->points[i]);
+        }
+        *pcl_wait_pub += *laserCloudWorld;
+
+        static pcl::VoxelGrid<PointType> downSizeFilterAccumulated;
+        static bool accumulated_filter_initialized = false;
+        if (!accumulated_filter_initialized)
+        {
+            constexpr float accumulated_leaf_size = 0.25f;
+            downSizeFilterAccumulated.setLeafSize(accumulated_leaf_size, accumulated_leaf_size, accumulated_leaf_size);
+            accumulated_filter_initialized = true;
+        }
+
+        PointCloudXYZI::Ptr accumulatedCloudDS(new PointCloudXYZI());
+        downSizeFilterAccumulated.setInputCloud(pcl_wait_pub);
+        downSizeFilterAccumulated.filter(*accumulatedCloudDS);
+
+        PointCloudXYZI::Ptr accumulatedCloudBody(new PointCloudXYZI(accumulatedCloudDS->size(), 1));
+        M3D rot_inv = state_point.rot.toRotationMatrix().transpose();
+        V3D trans_inv = -rot_inv * state_point.pos;
+        for (size_t i = 0; i < accumulatedCloudDS->size(); i++)
+        {
+            const PointType &point_world = accumulatedCloudDS->points[i];
+            V3D p_world(point_world.x, point_world.y, point_world.z);
+            V3D p_body = rot_inv * p_world + trans_inv;
+            PointType &point_body = accumulatedCloudBody->points[i];
+            point_body.x = p_body(0);
+            point_body.y = p_body(1);
+            point_body.z = p_body(2);
+            point_body.intensity = point_world.intensity;
+        }
+
+        sensor_msgs::PointCloud2 accumulatedMapMsg;
+        pcl::toROSMsg(*accumulatedCloudBody, accumulatedMapMsg);
+        accumulatedMapMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+        accumulatedMapMsg.header.frame_id = "body";
+        pubAccumulatedMap.publish(accumulatedMapMsg);
+
+        // 使用降采样后的点云回写缓存，控制累积点云规模
+        pcl_wait_pub->swap(*accumulatedCloudDS);
     }
 
     /**************** save map ****************/
@@ -1669,13 +1723,41 @@ void set_posestamp(T &out)
     out.pose.orientation.w = geoQuat.w;
 }
 
+template <typename T>
+void set_twiststamp(T &out)
+{
+    out.twist.linear.x = state_point.vel(0);
+    out.twist.linear.y = state_point.vel(1);
+    out.twist.linear.z = state_point.vel(2);
+
+    if (!Measures.imu.empty())
+    {
+        out.twist.angular.x = Measures.imu.back()->angular_velocity.x;
+        out.twist.angular.y = Measures.imu.back()->angular_velocity.y;
+        out.twist.angular.z = Measures.imu.back()->angular_velocity.z;
+    }
+    else
+    {
+        out.twist.angular.x = 0.0;
+        out.twist.angular.y = 0.0;
+        out.twist.angular.z = 0.0;
+    }
+}
+
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+    set_twiststamp(odomAftMapped.twist);
+
+    for (int i = 0; i < 36; i++)
+    {
+        odomAftMapped.pose.covariance[i] = 0.0;
+        odomAftMapped.twist.covariance[i] = 0.0;
+    }
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i++)
     {
@@ -1687,6 +1769,20 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
         odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
     }
+
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 3; j++)
+        {
+            odomAftMapped.twist.covariance[i * 6 + j] = P(12 + i, 12 + j);
+        }
+    }
+    for (int i = 3; i < 6; i++)
+    {
+        odomAftMapped.twist.covariance[i * 6 + i] = gyr_cov;
+    }
+
+    pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform transform;
@@ -2269,6 +2365,7 @@ int main(int argc, char **argv)
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);        //  world系下稠密点云
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);      //  body系下稠密点云
+    pubAccumulatedMap = nh.advertise<sensor_msgs::PointCloud2>("/accumulated_map_points", 10);
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100000);         //  no used
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);                    //  no used
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
@@ -2448,7 +2545,7 @@ int main(int argc, char **argv)
                     publishGlobalMap();             //  发布局部点云特征地图
                 }
             }
-            if (scan_pub_en || pcd_save_en)
+            if (scan_pub_en || pcd_save_en || pubAccumulatedMap.getNumSubscribers() > 0)
                 publish_frame_world(pubLaserCloudFull);        //   发布world系下的点云
             if (scan_pub_en && scan_body_pub_en)
                 publish_frame_body(pubLaserCloudFull_body);         //  发布imu系下的点云

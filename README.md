@@ -45,6 +45,13 @@ cd ..
 catkin_make
 ```
 
+## 2026.04.03 定向改动
+
+1. 里程计 `/Odometry` 补充 `twist` 输出，并发布 `pose/twist` 协方差。
+2. 新增累积点云发布话题 `/accumulated_map_points`：在 `camera_init` 下累积并降采样，再转换到 `body` 坐标系发布。
+3. 累积点云发布加入降采样缓存回写，避免历史点无限增长。
+4. 在预处理与激光回调链路增加 NaN 过滤，避免无效点进入特征提取与建图。
+
 ## Quick test
 
 ### Loop clousre：
