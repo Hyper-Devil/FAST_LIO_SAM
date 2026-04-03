@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.0.2)
 project(fast_lio_sam)
 
 # SET(CMAKE_BUILD_TYPE "Debug")  
@@ -58,7 +58,36 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
-find_package (GeographicLib REQUIRED)
+find_package(Boost REQUIRED COMPONENTS serialization thread timer chrono filesystem system date_time)
+find_package(GeographicLib QUIET)
+if(NOT GeographicLib_FOUND)
+  find_package(GeographicLib QUIET
+    PATHS /usr/local /usr
+    PATH_SUFFIXES lib/cmake/GeographicLib cmake/GeographicLib)
+endif()
+
+if(GeographicLib_FOUND)
+  message(STATUS "Found GeographicLib via CMake package")
+else()
+  message(STATUS "GeographicLib CMake package not found, trying manual search")
+  find_path(GeographicLib_INCLUDE_DIRS
+    NAMES GeographicLib/LocalCartesian.hpp
+    PATHS /usr/include /usr/local/include)
+
+  find_library(GeographicLib_LIBRARY
+    NAMES Geographic GeographicLib
+    PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/lib64)
+
+  if(GeographicLib_INCLUDE_DIRS AND GeographicLib_LIBRARY)
+    set(GeographicLib_LIBRARIES ${GeographicLib_LIBRARY})
+    set(GeographicLib_FOUND TRUE)
+    message(STATUS "Found GeographicLib manually: ${GeographicLib_LIBRARY}")
+  else()
+    message(FATAL_ERROR
+      "GeographicLib not found. Please install development package (e.g. libgeographic-dev) "
+      "or set GeographicLib_DIR to the directory containing geographiclib-config.cmake")
+  endif()
+endif()
 
 find_package( GTSAMCMakeTools )
 find_package(GTSAM REQUIRED QUIET)
@@ -109,5 +138,5 @@ catkin_package(
 add_library(ikd_Tree include/ikd-Tree/ikd_Tree.cpp)
 add_library(preprocess  src/preprocess.cpp)
 add_executable(fastlio_sam_mapping src/laserMapping.cpp)
-target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES}  ${GeographicLib_LIBRARIES} ikd_Tree preprocess gtsam) 
+target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} ikd_Tree preprocess ${Boost_LIBRARIES} gtsam)
 target_include_directories(fastlio_sam_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
