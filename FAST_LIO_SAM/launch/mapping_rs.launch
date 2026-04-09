@@ -1,13 +1,15 @@
 <launch>
   <!-- Launch file for velodyne16 VLP-16 LiDAR -->
 
+    <param name="use_sim_time" value="true" />
     <arg name="rviz" default="true" />
+    
     <arg name="gnss_coordinate_system" default="ENU" />
     <arg name="gnss_yaw_offset_deg" default="0.0" />
-      <arg name="gnss_invert_x" default="false" />
-      <arg name="gnss_invert_y" default="false" />
+    <arg name="gnss_invert_x" default="false" />
+    <arg name="gnss_invert_y" default="false" />
 
-      <rosparam command="load" file="$(find fast_lio_sam)/config/helios.yaml" />
+    <rosparam command="load" file="$(find fast_lio_sam)/config/helios.yaml" />
     <param name="gnssCoordinateSystem" type="str" value="$(arg gnss_coordinate_system)" />
     <param name="gnssYawOffsetDeg" type="double" value="$(arg gnss_yaw_offset_deg)" />
     <param name="gnssInvertX" type="bool" value="$(arg gnss_invert_x)" />
@@ -16,7 +18,7 @@
     <param name="feature_extract_enable" type="bool" value="0"/>
     <param name="point_filter_num" type="int" value="4"/>
     <param name="max_iteration" type="int" value="3" />
-  <!--	单帧内，畸变纠正后降采样的分辨率-->
+    <!--	单帧内，畸变纠正后降采样的分辨率-->
     <param name="filter_size_surf" type="double" value="0.5" />
     <param name="filter_size_map" type="double" value="0.5" />
     <param name="cube_side_length" type="double" value="1000" />
@@ -24,7 +26,16 @@
     <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping" output="screen" /> 
 
     <group if="$(arg rviz)">
-    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_lio_sam)/rviz_cfg/loam_livox.rviz" />
+      <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_lio_sam)/rviz_cfg/loam_livox.rviz" />
     </group>
+
+    <node pkg="tf" type="static_transform_publisher" name="map_to_odom" 
+      args="0 0 0 0 0 0 map odom 100" />
+
+    <node pkg="tf" type="static_transform_publisher" name="odom_to_camera_init" 
+      args="0 0 0 0 0 0 odom camera_init 100" />
+
+    <node pkg="tf" type="static_transform_publisher" name="body_to_base_link" 
+      args="0 0 0 0 0 0 body base_link 100" />
 
 </launch>
