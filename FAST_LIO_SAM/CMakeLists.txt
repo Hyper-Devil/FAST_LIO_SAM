@@ -51,7 +51,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   pcl_ros
   tf
-  livox_ros_driver
+  livox_ros_driver2
   message_generation
   eigen_conversions
 )
@@ -59,6 +59,20 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS serialization thread timer chrono filesystem system date_time)
+
+# Force system libusb for this project only to avoid /opt/MVS libusb conflicts.
+find_library(SYSTEM_LIBUSB_LIBRARY
+  NAMES usb-1.0
+  PATHS /usr/lib/x86_64-linux-gnu /usr/lib
+  NO_DEFAULT_PATH)
+if(NOT SYSTEM_LIBUSB_LIBRARY)
+  find_library(SYSTEM_LIBUSB_LIBRARY NAMES usb-1.0)
+endif()
+if(NOT SYSTEM_LIBUSB_LIBRARY)
+  message(FATAL_ERROR "System libusb (usb-1.0) not found")
+endif()
+message(STATUS "Using system libusb: ${SYSTEM_LIBUSB_LIBRARY}")
+
 find_package(GeographicLib QUIET)
 if(NOT GeographicLib_FOUND)
   find_package(GeographicLib QUIET
@@ -92,6 +106,14 @@ endif()
 find_package( GTSAMCMakeTools )
 find_package(GTSAM REQUIRED QUIET)
 
+if(NOT GTSAM_INCLUDE_DIRS AND GTSAM_INCLUDE_DIR)
+  set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
+endif()
+
+if(NOT GTSAM_LIBRARIES)
+  set(GTSAM_LIBRARIES gtsam)
+endif()
+
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 
 include_directories(
@@ -99,7 +121,7 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_DIRS}
-  ${GTSAM_INCLUDE_DIR}
+  ${GTSAM_INCLUDE_DIRS}
   ${GeographicLib_INCLUDE_DIRS}
   include)
 
@@ -138,5 +160,5 @@ catkin_package(
 add_library(ikd_Tree include/ikd-Tree/ikd_Tree.cpp)
 add_library(preprocess  src/preprocess.cpp)
 add_executable(fastlio_sam_mapping src/laserMapping.cpp)
-target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} ikd_Tree preprocess ${Boost_LIBRARIES} gtsam)
+target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} ikd_Tree preprocess ${Boost_LIBRARIES} ${GTSAM_LIBRARIES} ${SYSTEM_LIBUSB_LIBRARY})
 target_include_directories(fastlio_sam_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})

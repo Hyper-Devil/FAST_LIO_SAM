@@ -1,3 +1,19 @@
+## Project Updates (2026-04-10)
+
+This repository has the following local updates:
+
+1. Livox dependency upgraded from **livox_ros_driver** to **livox_ros_driver2** in build/package/source references.
+2. GeographicLib dependency handling has been validated on Ubuntu 20.04 using `libgeographic-dev`.
+3. GTSAM dependency installation flow validated with BorgLab PPA.
+4. Added CMake-level system `libusb` selection to avoid `/opt/MVS` library interference for this project only.
+
+Updated files:
+- `CMakeLists.txt`
+- `package.xml`
+- `src/preprocess.h`
+- `src/preprocess.cpp`
+- `src/laserMapping.cpp`
+
 ## Related Works
 
 1. [ikd-Tree](https://github.com/hku-mars/ikd-Tree): A state-of-art dynamic KD-Tree for 3D kNN search.
@@ -65,12 +81,61 @@ PCL    >= 1.8,   Follow [PCL Installation](http://www.pointclouds.org/downloads/
 
 Eigen  >= 3.3.4, Follow [Eigen Installation](http://eigen.tuxfamily.org/index.php?title=Main_Page).
 
-### 1.3. **livox_ros_driver**
-Follow [livox_ros_driver Installation](https://github.com/Livox-SDK/livox_ros_driver).
+### 1.3. **livox_ros_driver2**
+Follow [livox_ros_driver2 Installation](https://github.com/Livox-SDK/livox_ros_driver2).
 
 *Remarks:*
-- Since the FAST-LIO must support Livox serials LiDAR firstly, so the **livox_ros_driver** must be installed and **sourced** before run any FAST-LIO luanch file.
-- How to source? The easiest way is add the line ``` source $Licox_ros_driver_dir$/devel/setup.bash ``` to the end of file ``` ~/.bashrc ```, where ``` $Licox_ros_driver_dir$ ``` is the directory of the livox ros driver workspace (should be the ``` ws_livox ``` directory if you completely followed the livox official document).
+- Since the FAST-LIO must support Livox serials LiDAR firstly, the **livox_ros_driver2** must be installed and **sourced** before running any FAST-LIO launch file.
+- How to source? Add `source $LIVOX_ROS_DRIVER2_WS/devel/setup.bash` to `~/.bashrc`, where `$LIVOX_ROS_DRIVER2_WS` is the workspace directory of livox_ros_driver2.
+
+### 1.4. **GeographicLib**
+
+FAST_LIO_SAM uses GeographicLib in GNSS related modules.
+
+Install on Ubuntu 20.04:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgeographic-dev
+```
+
+Quick verification:
+
+```bash
+dpkg -s libgeographic-dev | grep -E "Status|Version"
+```
+
+If CMake still cannot find GeographicLib, set one of the following:
+
+```bash
+export CMAKE_PREFIX_PATH=/usr:$CMAKE_PREFIX_PATH
+# or pass GeographicLib_DIR when building
+```
+
+### 1.5. **GTSAM**
+
+Install (Ubuntu 20.04):
+
+```bash
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:borglab/gtsam-release-4.0
+sudo apt-get update
+sudo apt-get install -y libgtsam-dev libgtsam-unstable-dev
+```
+
+Quick verification:
+
+```bash
+dpkg -s libgtsam-dev | grep -E "Status|Version"
+```
+
+### 1.6. **/opt/MVS libusb conflict note**
+
+If your environment contains `/opt/MVS` in `LD_LIBRARY_PATH`, this project now forces system `libusb` selection in CMake for `fast_lio_sam` build/link.
+
+- Scope: only this project CMake, no global environment change.
+- Goal: avoid linker/runtime mismatch between PCL IO and non-system `libusb`.
+- This change does **not** modify or uninstall MVS.
 
 
 ## 2. Build
@@ -85,7 +150,7 @@ Clone the repository and catkin_make:
     catkin_make
     source devel/setup.bash
 ```
-- Remember to source the livox_ros_driver before build (follow 1.3 **livox_ros_driver**)
+- Remember to source the livox_ros_driver2 before build (follow 1.3 **livox_ros_driver2**)
 - If you want to use a custom build of PCL, add the following line to ~/.bashrc
 ```export PCL_ROOT={CUSTOM_PCL_PATH}```
 ## 3. Directly run
@@ -93,15 +158,16 @@ Noted:
 A. Please make sure the IMU and LiDAR are **Synchronized**, that's important.
 B. The warning message "Failed to find match for field 'time'." means the timestamps of each LiDAR points are missed in the rosbag file. That is important for the forward propagation and backwark propagation.
 ### 3.1 For Avia
-Connect to your PC to Livox Avia LiDAR by following  [Livox-ros-driver installation](https://github.com/Livox-SDK/livox_ros_driver), then
+Connect to your PC to Livox Avia LiDAR by following [Livox-ros-driver2 installation](https://github.com/Livox-SDK/livox_ros_driver2), then
 ```
     cd ~/$FAST_LIO_ROS_DIR$
     source devel/setup.bash
     roslaunch fast_lio mapping_avia.launch
-    roslaunch livox_ros_driver livox_lidar_msg.launch
+    # use your installed livox_ros_driver2 launch file here
+    # e.g. roslaunch livox_ros_driver2 <your_launch>.launch
 ```
-- For livox serials, FAST-LIO only support the data collected by the ``` livox_lidar_msg.launch ``` since only its ``` livox_ros_driver/CustomMsg ``` data structure produces the timestamp of each LiDAR point which is very important for the motion undistortion. ``` livox_lidar.launch ``` can not produce it right now.
-- If you want to change the frame rate, please modify the **publish_freq** parameter in the [livox_lidar_msg.launch](https://github.com/Livox-SDK/livox_ros_driver/blob/master/livox_ros_driver/launch/livox_lidar_msg.launch) of [Livox-ros-driver](https://github.com/Livox-SDK/livox_ros_driver) before make the livox_ros_driver pakage.
+- For livox serials, FAST-LIO requires per-point timestamps from `livox_ros_driver2/CustomMsg` for motion undistortion.
+- Please configure publish rate and launch settings in your livox_ros_driver2 launch configuration before building/running.
 
 ### 3.2 For Livox serials with external IMU
 
