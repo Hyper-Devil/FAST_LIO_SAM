@@ -25,6 +25,7 @@ mapping:
     fov_degree:    360
     det_range:     100.0
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic,
+    # 从 LiDAR 到 IMU 的坐标变换
     extrinsic_T: [ 0.038549, 0.048077, 0.141315 ]
     extrinsic_R: [ 0.999717,  0.008665, -0.022155,
                -0.008814, 0.999939,  -0.006658,

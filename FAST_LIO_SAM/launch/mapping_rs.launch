@@ -36,6 +36,15 @@
       args="0 0 0 0 0 0 odom camera_init 100" />
 
     <node pkg="tf" type="static_transform_publisher" name="body_to_base_link" 
-      args="0 0 0 0 0 0 body base_link 100" />
+      args=" -0.6 0 -0.88 0 0 0 body base_link 100" />
+
+    <node pkg="tf" type="static_transform_publisher" name="body_to_camera_left" 
+      args="0.202317 -0.007540 -0.150098 -1.564213 -0.009411 -1.592550 body camera_left 100" />
+
+    <node pkg="tf" type="static_transform_publisher" name="body_to_cam_left" 
+      args="0.202317 -0.007540 -0.150098 -1.564213 -0.009411 -1.592550 body cam_left 100" />     
+
+    <node pkg="tf" type="static_transform_publisher" name="body_to_imu_link" 
+      args="-0.041237 -0.049376 -0.140103 0.008667 0.022157 -0.006659 body imu_link 100" />
 
 </launch>

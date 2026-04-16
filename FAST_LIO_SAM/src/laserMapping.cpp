@@ -1807,11 +1807,12 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
         }
         *pcl_wait_pub += *laserCloudWorld;
 
+        // 1. VoxelGrid 降采样（1.0m 体素，比原 0.25m 稀疏 64 倍）
         static pcl::VoxelGrid<PointType> downSizeFilterAccumulated;
         static bool accumulated_filter_initialized = false;
         if (!accumulated_filter_initialized)
         {
-            constexpr float accumulated_leaf_size = 0.25f;
+            constexpr float accumulated_leaf_size = 1.0f;
             downSizeFilterAccumulated.setLeafSize(accumulated_leaf_size, accumulated_leaf_size, accumulated_leaf_size);
             accumulated_filter_initialized = true;
         }
@@ -1820,14 +1821,28 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
         downSizeFilterAccumulated.setInputCloud(pcl_wait_pub);
         downSizeFilterAccumulated.filter(*accumulatedCloudDS);
 
-        PointCloudXYZI::Ptr accumulatedCloudBody(new PointCloudXYZI(accumulatedCloudDS->size(), 1));
+        // 2. CropBox：仅保留当前位置 ±20m 范围内的点（world 系），使点云规模与行驶距离无关
+        constexpr float ACCUM_MAP_RADIUS = 20.0f;
+        const V3D &cur_pos = state_point.pos;
+        pcl::CropBox<PointType> cropBox;
+        cropBox.setMin(Eigen::Vector4f(cur_pos(0) - ACCUM_MAP_RADIUS,
+                                       cur_pos(1) - ACCUM_MAP_RADIUS,
+                                       cur_pos(2) - ACCUM_MAP_RADIUS, 1.0f));
+        cropBox.setMax(Eigen::Vector4f(cur_pos(0) + ACCUM_MAP_RADIUS,
+                                       cur_pos(1) + ACCUM_MAP_RADIUS,
+                                       cur_pos(2) + ACCUM_MAP_RADIUS, 1.0f));
+        cropBox.setInputCloud(accumulatedCloudDS);
+        PointCloudXYZI::Ptr accumulatedCloudCropped(new PointCloudXYZI());
+        cropBox.filter(*accumulatedCloudCropped);
+
+        // 3. 转换到 body 系发布
         M3D rot_inv = state_point.rot.toRotationMatrix().transpose();
-        V3D trans_inv = -rot_inv * state_point.pos;
-        for (size_t i = 0; i < accumulatedCloudDS->size(); i++)
+        V3D trans_inv = -rot_inv * cur_pos;
+        PointCloudXYZI::Ptr accumulatedCloudBody(new PointCloudXYZI(accumulatedCloudCropped->size(), 1));
+        for (size_t i = 0; i < accumulatedCloudCropped->size(); i++)
         {
-            const PointType &point_world = accumulatedCloudDS->points[i];
-            V3D p_world(point_world.x, point_world.y, point_world.z);
-            V3D p_body = rot_inv * p_world + trans_inv;
+            const PointType &point_world = accumulatedCloudCropped->points[i];
+            V3D p_body = rot_inv * V3D(point_world.x, point_world.y, point_world.z) + trans_inv;
             PointType &point_body = accumulatedCloudBody->points[i];
             point_body.x = p_body(0);
             point_body.y = p_body(1);
@@ -1841,8 +1856,8 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
         accumulatedMapMsg.header.frame_id = "body";
         pubAccumulatedMap.publish(accumulatedMapMsg);
 
-        // 使用降采样后的点云回写缓存，控制累积点云规模
-        pcl_wait_pub->swap(*accumulatedCloudDS);
+        // 4. 裁剪后的点云回写缓存（同时淘汰远距离历史点，使 pcl_wait_pub 规模有界）
+        pcl_wait_pub->swap(*accumulatedCloudCropped);
     }
 
     /**************** save map ****************/
@@ -2727,7 +2742,7 @@ int main(int argc, char **argv)
             fout_pre << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose() << " " << ext_euler.transpose() << " " << state_point.offset_T_L_I.transpose() << " " << state_point.vel.transpose()
                      << " " << state_point.bg.transpose() << " " << state_point.ba.transpose() << " " << state_point.grav << endl;
 
-            if (visulize_IkdtreeMap) // If you need to see map point, change to "if(1)"
+            if (visulize_IkdtreeMap && pubLaserCloudMap.getNumSubscribers() > 0)
             {
                 PointVector().swap(ikdtree.PCL_Storage);
                 ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
