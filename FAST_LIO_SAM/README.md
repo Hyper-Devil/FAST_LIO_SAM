@@ -1,18 +1,53 @@
-## Project Updates (2026-04-10)
+## Local Modifications Log (Hyper-Devil)
 
-This repository has the following local updates:
+This fork contains the following modifications on top of the upstream FAST_LIO_SAM. Changes are listed in reverse-chronological order.
 
-1. Livox dependency upgraded from **livox_ros_driver** to **livox_ros_driver2** in build/package/source references.
-2. GeographicLib dependency handling has been validated on Ubuntu 20.04 using `libgeographic-dev`.
-3. GTSAM dependency installation flow validated with BorgLab PPA.
-4. Added CMake-level system `libusb` selection to avoid `/opt/MVS` library interference for this project only.
+---
 
-Updated files:
-- `CMakeLists.txt`
-- `package.xml`
-- `src/preprocess.h`
-- `src/preprocess.cpp`
-- `src/laserMapping.cpp`
+### 2026-04-16 — `/accumulated_map_points` performance fix (voxel + local crop)
+
+**Problem:** The `/accumulated_map_points` topic ran an unbounded VoxelGrid downsampling (0.25 m leaf) and full inverse-transform every LiDAR frame in the main thread. After ~200 s of driving the accumulated cloud grew to ~700 k points, causing the main loop to fall >1 s behind and producing a visible TF lag on `camera_init → body`.
+
+**Root cause confirmed** via `scripts/diag_timestamp_lag.py`: IMU and LiDAR timestamps were stable throughout the 300 s bag; `/Odometry` lag only exploded at ~200 s, tracking the growth of the accumulated cloud exactly.
+
+**Fixes applied in `src/laserMapping.cpp`:**
+
+1. **`/Laser_map` subscriber guard** — `ikdtree.flatten()` and `publish_map()` are now skipped unless someone is actively subscribed, eliminating a per-frame O(N) tree copy when the topic is unused.
+
+2. **`/accumulated_map_points` — coarser voxel + local crop:**
+   - Leaf size increased from `0.25 m` → `1.0 m` (≈ 64× fewer points in the VoxelGrid pass).
+   - After downsampling, a `pcl::CropBox` retains only points within **±20 m** of the current body position (world frame). The cropped result is written back to `pcl_wait_pub`, so the cache size is now bounded by local point density rather than total travel distance.
+   - Processing time is O(constant) regardless of bag length; `/Odometry` lag stays flat at ~30 ms throughout the 300 s bag.
+
+Added `scripts/diag_timestamp_lag.py`: subscribes to `/imu/data`, `/rslidar_points`, `/Odometry`, `/Laser_map`, `/accumulated_map_points` and logs `(topic, sim_time, lag, cloud_size)` to `~/catkin_slam/timestamp_lag.csv` for post-run analysis.
+
+---
+
+### 2026-04-10 — Dependency upgrades and MVS conflict fix
+
+1. Livox dependency upgraded from **livox_ros_driver** to **livox_ros_driver2** in `CMakeLists.txt`, `package.xml`, and source includes.
+2. GeographicLib dependency validated on Ubuntu 20.04 (`libgeographic-dev`).
+3. GTSAM dependency installation validated with BorgLab PPA (`libgtsam-dev`, `libgtsam-unstable-dev`).
+4. Added CMake-level system `libusb` selection to avoid `/opt/MVS` linker interference — scope is this project only, no global environment change.
+
+Updated files: `CMakeLists.txt`, `package.xml`, `src/preprocess.h`, `src/preprocess.cpp`, `src/laserMapping.cpp`.
+
+---
+
+### 2026-04-09 — `use_sim_time` support
+
+Added `<param name="use_sim_time" value="true"/>` to `launch/mapping_rs.launch` for correct behaviour when replaying bags with `rosbag play --clock`.
+
+---
+
+### 2026-04-03 — RS LiDAR support, accumulated map, GNSS tuning, performance fix
+
+| Commit | Change |
+|---|---|
+| RS data format fix | Added `config/helios.yaml` (Robosense Helios 32-line config); fixed point-field parsing in `src/preprocess.cpp` / `src/preprocess.h`; updated RViz config. Added `scripts/imu_gps_pose_tf_node.py` to republish IMU+GPS as a combined TF. |
+| Accumulated map + twist | Added `/accumulated_map_points` publisher (world-accumulated, body-frame output). Added velocity (twist) output to `/Odometry`. |
+| GNSS tuning | Improved GNSS-LIO heading initialisation from ENU IMU orientation; tuned covariance gates (`gpsCovThreshold`, `poseCovThreshold`) for higher accuracy without GNSS dependency. Updated `config/helios.yaml` and `launch/mapping_rs.launch`. |
+| Performance fix | Resolved CPU bottleneck from unbounded `pcl_wait_save` growth and excessive logging output. Cleaned up stale log files. |
 
 ## Related Works
 
