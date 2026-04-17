@@ -292,6 +292,65 @@ when you want to see the path in the Map [satellite map](http://dict.youdao.com/
 2.当前改进：默认使用 `useImuHeadingInitialization=true` + `gnssCoordinateSystem=ENU`，在首帧对齐 `GNSS local -> SLAM world`，并在同一链路内完成协方差变换与质量门控。
 
 
+# FAST_LIO_SAM 与 MVS 共存排障记录（2026-04-17）
+## 1. 运行时报错现象
+在 fast_lio_sam 可执行程序运行时出现：
+/home/ugv/catkin_ws/devel/lib/fast_lio_sam/fastlio_sam_mapping: symbol lookup error: /lib/x86_64-linux-gnu/libpcl_io.so.1.10: undefined symbol: libusb_set_option
+
+## 2. 根因分析
+- 系统里同时存在两套 libusb：
+  - 系统库：/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0
+  - MVS 库：/opt/MVS/lib/64/libusb-1.0.so.0
+- PCL 运行时依赖 libusb。若动态加载顺序命中 MVS 的旧版 libusb，就会缺少 libusb_set_option 符号并崩溃。
+- 所以这是运行时动态库优先级问题，不只是编译链接问题。
+
+## 3. 之前的修改方案（第一步，编译/链接层）
+已在 FAST_LIO_SAM 的 CMakeLists.txt 中处理：
+- 通过 find_library 优先在 /usr/lib/x86_64-linux-gnu 查找系统 libusb。
+- 将 ${SYSTEM_LIBUSB_LIBRARY} 显式加入 fastlio_sam_mapping 的 target_link_libraries。
+
+目的：尽量保证链接阶段选中系统 libusb，而不是 MVS 的同名库。
+
+## 4. 这次的补充方案（第二步，运行时层，关键）
+在 CMakeLists.txt 中追加：
+- get_filename_component(SYSTEM_LIBUSB_DIR ${SYSTEM_LIBUSB_LIBRARY} DIRECTORY)
+- 为 fastlio_sam_mapping 增加 set_target_properties：
+  - BUILD_RPATH "${SYSTEM_LIBUSB_DIR}"
+  - INSTALL_RPATH "${SYSTEM_LIBUSB_DIR}"
+  - INSTALL_RPATH_USE_LINK_PATH TRUE
+  - LINK_FLAGS "-Wl,--disable-new-dtags"
+
+作用：
+- 生成 DT_RPATH（而非仅 RUNPATH），让程序优先按 RPATH 到系统目录找 libusb。
+- 在存在 /opt/MVS 路径的环境里，仍优先加载系统 libusb，避免符号冲突。
+
+## 5. 重编命令
+cd /home/ugv/catkin_ws
+source /opt/ros/noetic/setup.bash
+catkin_make -DCATKIN_WHITELIST_PACKAGES=fast_lio_sam
+
+## 6. 验证命令
+### 6.1 检查 RPATH
+readelf -d /home/ugv/catkin_ws/devel/lib/fast_lio_sam/fastlio_sam_mapping | grep -E 'RPATH|RUNPATH'
+
+预期：出现 RPATH，且包含 /usr/lib/x86_64-linux-gnu。
+
+### 6.2 检查 libusb 实际解析
+ldd /home/ugv/catkin_ws/devel/lib/fast_lio_sam/fastlio_sam_mapping | grep -E 'libusb-1.0.so.0|libpcl_io.so.1.10'
+
+预期：
+- libpcl_io.so.1.10 -> /usr/lib/x86_64-linux-gnu/libpcl_io.so.1.10
+- libusb-1.0.so.0 -> /usr/lib/x86_64-linux-gnu/libusb-1.0.so.0
+
+不应再出现：/opt/MVS/lib/64/libusb-1.0.so.0
+
+## 7. 运行命令（当前推荐）
+source /opt/ros/noetic/setup.bash && source /home/ugv/catkin_ws/devel/setup.bash && roslaunch fast_lio_sam mapping_rs.launch use_sim_time:=false rviz:=false
+
+## 8. 共存建议
+- 不需要卸载 MVS。
+- 将冲突处理限定在 fast_lio_sam 工程内（CMake + RPATH）是最稳妥方案。
+- 若后续清理 build/devel 后重编，仍会自动带上该修复。
 
 ## UpdateLogs:
 
