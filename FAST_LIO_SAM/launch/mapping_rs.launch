@@ -1,7 +1,8 @@
 <launch>
   <!-- Launch file for velodyne16 VLP-16 LiDAR -->
 
-    <param name="use_sim_time" value="true" />
+    <arg name="use_sim_time" default="false" />
+    <param name="use_sim_time" value="$(arg use_sim_time)" />
     <arg name="rviz" default="true" />
     
     <arg name="gnss_coordinate_system" default="ENU" />

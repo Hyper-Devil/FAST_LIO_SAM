@@ -71,7 +71,9 @@ endif()
 if(NOT SYSTEM_LIBUSB_LIBRARY)
   message(FATAL_ERROR "System libusb (usb-1.0) not found")
 endif()
+get_filename_component(SYSTEM_LIBUSB_DIR ${SYSTEM_LIBUSB_LIBRARY} DIRECTORY)
 message(STATUS "Using system libusb: ${SYSTEM_LIBUSB_LIBRARY}")
+message(STATUS "Using system libusb dir: ${SYSTEM_LIBUSB_DIR}")
 
 find_package(GeographicLib QUIET)
 if(NOT GeographicLib_FOUND)
@@ -161,4 +163,9 @@ add_library(ikd_Tree include/ikd-Tree/ikd_Tree.cpp)
 add_library(preprocess  src/preprocess.cpp)
 add_executable(fastlio_sam_mapping src/laserMapping.cpp)
 target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} ikd_Tree preprocess ${Boost_LIBRARIES} ${GTSAM_LIBRARIES} ${SYSTEM_LIBUSB_LIBRARY})
+set_target_properties(fastlio_sam_mapping PROPERTIES
+  BUILD_RPATH "${SYSTEM_LIBUSB_DIR}"
+  INSTALL_RPATH "${SYSTEM_LIBUSB_DIR}"
+  INSTALL_RPATH_USE_LINK_PATH TRUE
+  LINK_FLAGS "-Wl,--disable-new-dtags")
 target_include_directories(fastlio_sam_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
