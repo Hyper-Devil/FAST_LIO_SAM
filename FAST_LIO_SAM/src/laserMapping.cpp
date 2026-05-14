@@ -34,6 +34,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <math.h>
 #include <algorithm>
 #include <cctype>
@@ -279,6 +281,31 @@ Eigen::MatrixXd poseCovariance;
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap ;           //   发布最后优化的地图
 ros::Publisher pubAccumulatedMap;                //   发布累积降采样点云（body系）
+
+struct AccumulatedMapFrame
+{
+    PointCloudXYZI::Ptr cloud_body;
+    M3D rot;
+    V3D pos;
+    M3D offset_R_L_I;
+    V3D offset_T_L_I;
+    double stamp;
+};
+
+mutex mtx_accumulated_map;
+condition_variable sig_accumulated_map;
+deque<AccumulatedMapFrame> accumulated_map_frame_queue;
+PointCloudXYZI::Ptr accumulated_map_world_cache(new PointCloudXYZI());
+bool accumulated_map_thread_exit = false;
+float accum_map_pub_hz = 5.0f;
+float accum_map_forward_range = 10.0f;
+float accum_map_backward_range = 10.0f;
+float accum_map_side_range = 10.0f;
+float accum_map_z_range = 3.0f;
+float accum_map_front_leaf_size = 0.1f;
+float accum_map_rear_leaf_size = 0.3f;
+float accum_map_degraded_leaf_size = 0.3f;
+int accum_map_max_points = 250000;
 
 bool    recontructKdTree = false;
 int updateKdtreeCount = 0 ;        //  每100次更新一次
@@ -1185,9 +1212,9 @@ void loopClosureThread()
 
 void SigHandle(int sig)
 {
+    (void)sig;
     flg_exit = true;
-    ROS_WARN("catch sig %d", sig);
-    sig_buffer.notify_all();
+    ros::shutdown();
 }
 
 inline void dump_lio_state_to_log(FILE *fp)
@@ -1771,8 +1798,170 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+
+PointType transformAccumPointBodyToWorld(const PointType &point_body, const AccumulatedMapFrame &frame)
+{
+    V3D p_body(point_body.x, point_body.y, point_body.z);
+    V3D p_world(frame.rot * (frame.offset_R_L_I * p_body + frame.offset_T_L_I) + frame.pos);
+
+    PointType point_world;
+    point_world.x = p_world(0);
+    point_world.y = p_world(1);
+    point_world.z = p_world(2);
+    point_world.intensity = point_body.intensity;
+    return point_world;
+}
+
+PointType transformAccumPointWorldToBody(const PointType &point_world, const M3D &rot, const V3D &pos)
+{
+    V3D p_body = rot.transpose() * (V3D(point_world.x, point_world.y, point_world.z) - pos);
+
+    PointType point_body;
+    point_body.x = p_body(0);
+    point_body.y = p_body(1);
+    point_body.z = p_body(2);
+    point_body.intensity = point_world.intensity;
+    return point_body;
+}
+
+void downsampleAccumulatedCloud(const PointCloudXYZI::Ptr &cloud_in, float leaf_size, PointCloudXYZI::Ptr &cloud_out)
+{
+    pcl::VoxelGrid<PointType> filter;
+    filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+    filter.setInputCloud(cloud_in);
+    filter.filter(*cloud_out);
+}
+
+void publishAccumulatedMapThread()
+{
+    ros::WallDuration publish_period(1.0 / std::max(0.1f, accum_map_pub_hz));
+
+    while (ros::ok())
+    {
+        deque<AccumulatedMapFrame> local_frames;
+        {
+            unique_lock<mutex> lock(mtx_accumulated_map);
+            sig_accumulated_map.wait_for(lock, std::chrono::milliseconds(20), [] {
+                return accumulated_map_thread_exit || !accumulated_map_frame_queue.empty();
+            });
+
+            if (accumulated_map_thread_exit)
+                break;
+
+            accumulated_map_frame_queue.swap(local_frames);
+        }
+
+        if (pubAccumulatedMap.getNumSubscribers() == 0)
+        {
+            accumulated_map_world_cache->clear();
+            publish_period.sleep();
+            continue;
+        }
+
+        if (local_frames.empty())
+        {
+            publish_period.sleep();
+            continue;
+        }
+
+        AccumulatedMapFrame latest_frame = local_frames.back();
+        for (const auto &frame : local_frames)
+        {
+            PointCloudXYZI::Ptr cloud_world(new PointCloudXYZI());
+            cloud_world->resize(frame.cloud_body->size());
+            for (size_t i = 0; i < frame.cloud_body->size(); ++i)
+                cloud_world->points[i] = transformAccumPointBodyToWorld(frame.cloud_body->points[i], frame);
+            *accumulated_map_world_cache += *cloud_world;
+        }
+
+        M3D rot_inv = latest_frame.rot.transpose();
+        PointCloudXYZI::Ptr cropped_world(new PointCloudXYZI());
+        PointCloudXYZI::Ptr front_body(new PointCloudXYZI());
+        PointCloudXYZI::Ptr rear_body(new PointCloudXYZI());
+        cropped_world->reserve(accumulated_map_world_cache->size());
+        front_body->reserve(accumulated_map_world_cache->size());
+        rear_body->reserve(accumulated_map_world_cache->size());
+
+        for (const auto &point_world : accumulated_map_world_cache->points)
+        {
+            V3D p_body_vec = rot_inv * (V3D(point_world.x, point_world.y, point_world.z) - latest_frame.pos);
+            if (p_body_vec(0) < -accum_map_backward_range || p_body_vec(0) > accum_map_forward_range ||
+                fabs(p_body_vec(1)) > accum_map_side_range || fabs(p_body_vec(2)) > accum_map_z_range)
+            {
+                continue;
+            }
+
+            cropped_world->push_back(point_world);
+            PointType point_body;
+            point_body.x = p_body_vec(0);
+            point_body.y = p_body_vec(1);
+            point_body.z = p_body_vec(2);
+            point_body.intensity = point_world.intensity;
+
+            if (p_body_vec(0) >= 0.0)
+                front_body->push_back(point_body);
+            else
+                rear_body->push_back(point_body);
+        }
+
+        accumulated_map_world_cache->swap(*cropped_world);
+
+        PointCloudXYZI::Ptr front_ds(new PointCloudXYZI());
+        PointCloudXYZI::Ptr rear_ds(new PointCloudXYZI());
+        downsampleAccumulatedCloud(front_body, accum_map_front_leaf_size, front_ds);
+        downsampleAccumulatedCloud(rear_body, accum_map_rear_leaf_size, rear_ds);
+
+        PointCloudXYZI::Ptr publish_body(new PointCloudXYZI());
+        *publish_body += *front_ds;
+        *publish_body += *rear_ds;
+
+        if (accum_map_max_points > 0 && publish_body->size() > static_cast<size_t>(accum_map_max_points))
+        {
+            PointCloudXYZI::Ptr all_body(new PointCloudXYZI());
+            all_body->reserve(accumulated_map_world_cache->size());
+            for (const auto &point_world : accumulated_map_world_cache->points)
+                all_body->push_back(transformAccumPointWorldToBody(point_world, latest_frame.rot, latest_frame.pos));
+
+            publish_body.reset(new PointCloudXYZI());
+            downsampleAccumulatedCloud(all_body, accum_map_degraded_leaf_size, publish_body);
+            ROS_WARN_THROTTLE(5.0, "/accumulated_map_points degraded to %.2fm leaf: %zu points over limit %d",
+                              accum_map_degraded_leaf_size, publish_body->size(), accum_map_max_points);
+        }
+
+        sensor_msgs::PointCloud2 accumulatedMapMsg;
+        pcl::toROSMsg(*publish_body, accumulatedMapMsg);
+        accumulatedMapMsg.header.stamp = ros::Time().fromSec(latest_frame.stamp);
+        accumulatedMapMsg.header.frame_id = "body";
+        pubAccumulatedMap.publish(accumulatedMapMsg);
+
+        publish_period.sleep();
+    }
+}
+
+void queueAccumulatedMapFrame()
+{
+    if (pubAccumulatedMap.getNumSubscribers() == 0)
+        return;
+
+    AccumulatedMapFrame frame;
+    frame.cloud_body.reset(new PointCloudXYZI(*feats_undistort));
+    frame.rot = state_point.rot.toRotationMatrix();
+    frame.pos = state_point.pos;
+    frame.offset_R_L_I = state_point.offset_R_L_I;
+    frame.offset_T_L_I = state_point.offset_T_L_I;
+    frame.stamp = lidar_end_time;
+
+    {
+        lock_guard<mutex> lock(mtx_accumulated_map);
+        accumulated_map_frame_queue.push_back(frame);
+        const size_t max_pending_frames = static_cast<size_t>(std::max(1.0f, accum_map_pub_hz * 2.0f));
+        while (accumulated_map_frame_queue.size() > max_pending_frames)
+            accumulated_map_frame_queue.pop_front();
+    }
+    sig_accumulated_map.notify_one();
+}
+
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    将稠密点云从 imu convert to  world
 {
     if (scan_pub_en)
@@ -1797,68 +1986,7 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
     }
 
     if (pubAccumulatedMap.getNumSubscribers() > 0)
-    {
-        int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i],
-                                &laserCloudWorld->points[i]);
-        }
-        *pcl_wait_pub += *laserCloudWorld;
-
-        // 1. VoxelGrid 降采样（1.0m 体素，比原 0.25m 稀疏 64 倍）
-        static pcl::VoxelGrid<PointType> downSizeFilterAccumulated;
-        static bool accumulated_filter_initialized = false;
-        if (!accumulated_filter_initialized)
-        {
-            constexpr float accumulated_leaf_size = 1.0f;
-            downSizeFilterAccumulated.setLeafSize(accumulated_leaf_size, accumulated_leaf_size, accumulated_leaf_size);
-            accumulated_filter_initialized = true;
-        }
-
-        PointCloudXYZI::Ptr accumulatedCloudDS(new PointCloudXYZI());
-        downSizeFilterAccumulated.setInputCloud(pcl_wait_pub);
-        downSizeFilterAccumulated.filter(*accumulatedCloudDS);
-
-        // 2. CropBox：仅保留当前位置 ±20m 范围内的点（world 系），使点云规模与行驶距离无关
-        constexpr float ACCUM_MAP_RADIUS = 20.0f;
-        const V3D &cur_pos = state_point.pos;
-        pcl::CropBox<PointType> cropBox;
-        cropBox.setMin(Eigen::Vector4f(cur_pos(0) - ACCUM_MAP_RADIUS,
-                                       cur_pos(1) - ACCUM_MAP_RADIUS,
-                                       cur_pos(2) - ACCUM_MAP_RADIUS, 1.0f));
-        cropBox.setMax(Eigen::Vector4f(cur_pos(0) + ACCUM_MAP_RADIUS,
-                                       cur_pos(1) + ACCUM_MAP_RADIUS,
-                                       cur_pos(2) + ACCUM_MAP_RADIUS, 1.0f));
-        cropBox.setInputCloud(accumulatedCloudDS);
-        PointCloudXYZI::Ptr accumulatedCloudCropped(new PointCloudXYZI());
-        cropBox.filter(*accumulatedCloudCropped);
-
-        // 3. 转换到 body 系发布
-        M3D rot_inv = state_point.rot.toRotationMatrix().transpose();
-        V3D trans_inv = -rot_inv * cur_pos;
-        PointCloudXYZI::Ptr accumulatedCloudBody(new PointCloudXYZI(accumulatedCloudCropped->size(), 1));
-        for (size_t i = 0; i < accumulatedCloudCropped->size(); i++)
-        {
-            const PointType &point_world = accumulatedCloudCropped->points[i];
-            V3D p_body = rot_inv * V3D(point_world.x, point_world.y, point_world.z) + trans_inv;
-            PointType &point_body = accumulatedCloudBody->points[i];
-            point_body.x = p_body(0);
-            point_body.y = p_body(1);
-            point_body.z = p_body(2);
-            point_body.intensity = point_world.intensity;
-        }
-
-        sensor_msgs::PointCloud2 accumulatedMapMsg;
-        pcl::toROSMsg(*accumulatedCloudBody, accumulatedMapMsg);
-        accumulatedMapMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        accumulatedMapMsg.header.frame_id = "body";
-        pubAccumulatedMap.publish(accumulatedMapMsg);
-
-        // 4. 裁剪后的点云回写缓存（同时淘汰远距离历史点，使 pcl_wait_pub 规模有界）
-        pcl_wait_pub->swap(*accumulatedCloudCropped);
-    }
+        queueAccumulatedMapFrame();
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
@@ -2442,6 +2570,17 @@ int main(int argc, char **argv)
     nh.param<bool>("publish/scan_publish_en", scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en", dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, true);
+    float accum_map_leaf_size;
+    nh.param<float>("publish/accum_map_leaf_size", accum_map_leaf_size, 0.3f);
+    nh.param<float>("publish/accum_map_pub_hz", accum_map_pub_hz, 5.0f);
+    nh.param<float>("publish/accum_map_forward_range", accum_map_forward_range, 10.0f);
+    nh.param<float>("publish/accum_map_backward_range", accum_map_backward_range, 10.0f);
+    nh.param<float>("publish/accum_map_side_range", accum_map_side_range, 10.0f);
+    nh.param<float>("publish/accum_map_z_range", accum_map_z_range, 3.0f);
+    nh.param<float>("publish/accum_map_front_leaf_size", accum_map_front_leaf_size, 0.1f);
+    nh.param<float>("publish/accum_map_rear_leaf_size", accum_map_rear_leaf_size, accum_map_leaf_size);
+    nh.param<float>("publish/accum_map_degraded_leaf_size", accum_map_degraded_leaf_size, accum_map_leaf_size);
+    nh.param<int>("publish/accum_map_max_points", accum_map_max_points, 250000);
     nh.param<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     nh.param<string>("map_file_path", map_file_path, "");
     nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
@@ -2616,18 +2755,26 @@ int main(int argc, char **argv)
         cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
 
     /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
-    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);        //  world系下稠密点云
-    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);      //  body系下稠密点云
-    pubAccumulatedMap = nh.advertise<sensor_msgs::PointCloud2>("/accumulated_map_points", 10);
-    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100000);         //  no used
-    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);                    //  no used
-    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
-    ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 1e00000);
+    const int kLidarSubQueueSize = 2000;
+    const int kImuSubQueueSize = 2000;
+    const int kGnssSubQueueSize = 200;
+    const int kPointCloudPubQueueSize = 2;
+    const int kAccumulatedMapPubQueueSize = 2;
+    const int kOdomPubQueueSize = 100;
+    const int kPathPubQueueSize = 10;
 
-    ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
-    pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
+    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, kLidarSubQueueSize, livox_pcl_cbk) : nh.subscribe(lid_topic, kLidarSubQueueSize, standard_pcl_cbk);
+    ros::Subscriber sub_imu = nh.subscribe(imu_topic, kImuSubQueueSize, imu_cbk);
+    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", kPointCloudPubQueueSize);        //  world系下稠密点云
+    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", kPointCloudPubQueueSize);      //  body系下稠密点云
+    pubAccumulatedMap = nh.advertise<sensor_msgs::PointCloud2>("/accumulated_map_points", kAccumulatedMapPubQueueSize);
+    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", kPointCloudPubQueueSize);         //  no used
+    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", kPointCloudPubQueueSize);                    //  no used
+    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", kOdomPubQueueSize);
+    ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", kPathPubQueueSize);
+
+    ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", kPathPubQueueSize);                   //  isam更新后的path
+    pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", kPathPubQueueSize);
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
     pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/map_global_optimized", 1); // 发布局部关键帧map的特征点云
 
@@ -2640,7 +2787,7 @@ int main(int argc, char **argv)
     pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("/fast_lio_sam/mapping/loop_closure_constraints", 1);
 
     // gnss
-    ros::Subscriber sub_gnss = nh.subscribe(gnss_topic, 200000, gnss_cbk);
+    ros::Subscriber sub_gnss = nh.subscribe(gnss_topic, kGnssSubQueueSize, gnss_cbk);
     
     // saveMap  发布地图保存服务
     srvSaveMap  = nh.advertiseService("/save_map" ,  &saveMapService);
@@ -2653,7 +2800,8 @@ int main(int argc, char **argv)
 
     //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
+    thread accumulated_map_thread(publishAccumulatedMapThread);
+    ros::WallRate rate(5000);
     bool status = ros::ok();
     while (status)
     {
@@ -2881,6 +3029,13 @@ int main(int argc, char **argv)
     }
 
     startFlag = false;
+    {
+        lock_guard<mutex> lock(mtx_accumulated_map);
+        accumulated_map_thread_exit = true;
+    }
+    sig_accumulated_map.notify_all();
+    if (accumulated_map_thread.joinable())
+        accumulated_map_thread.join();
     loopthread.join(); //  分离线程
 
     return 0;

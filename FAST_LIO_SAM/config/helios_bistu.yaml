@@ -1,0 +1,120 @@
+common:
+    lid_topic:  "/rslidar_points"     #"/velodyne_points"
+    imu_topic:  "/imu/data"
+    gnss_topic:  "/imu/gpss"         # 不使用
+    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                  # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+    
+preprocess:
+    lidar_type: 4                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for RS LiDAR
+    scan_line: 32
+    scan_rate: 10                # only need to be set for velodyne, unit: Hz,
+    blind: 2
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    360
+    det_range:     100.0
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic,
+    # 从 LiDAR 到 IMU 的坐标变换
+    extrinsic_T: [-0.08019078137763, -0.02550745406746, 0.12670900114931]
+    extrinsic_R: [0.996058880159782, 0.076660373485952, -0.0097827817288, 
+                  -0.026866478560205, 1.004460696081592, -0.022656222716123, 
+                  0.01346481467083, 0.018128668072967, 1.012436167071725]
+
+    # GNSS (antenna) to LiDAR extrinsic
+    # keep identity/zero if already pre-aligned in upstream localization frame
+    extrinT_Gnss2Lidar: [ 0.0, 0.0, 0.0 ]
+    extrinR_Gnss2Lidar: [ 1.0, 0.0, 0.0,
+                          0.0, 1.0, 0.0,
+                          0.0, 0.0, 1.0 ]
+    
+publish:
+    path_en:  true
+    scan_publish_en:  true       # false: close all the point cloud output
+    dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    accum_map_leaf_size: 0.3     # compatibility default for /accumulated_map_points (m)
+    accum_map_pub_hz: 5.0        # async publish rate for /accumulated_map_points
+    accum_map_forward_range: 10.0
+    accum_map_backward_range: 10.0
+    accum_map_side_range: 10.0
+    accum_map_z_range: 3.0
+    accum_map_front_leaf_size: 0.1
+    accum_map_rear_leaf_size: 0.3
+    accum_map_degraded_leaf_size: 0.3
+    accum_map_max_points: 250000
+
+pcd_save:
+    pcd_save_en: false
+    interval: -1                 # how many LiDAR frames saved in each pcd file; 
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+# voxel filter paprams
+odometrySurfLeafSize: 0.4                     # default: 0.4 - outdoor, 0.2 - indoor
+mappingCornerLeafSize: 0.2                    # default: 0.2 - outdoor, 0.1 - indoor
+mappingSurfLeafSize: 0.4                      # default: 0.4 - outdoor, 0.2 - indoor
+
+# robot motion constraint (in case you are using a 2D robot)
+z_tollerance: 1000                            # meters
+rotation_tollerance: 1000                     # radians
+
+# CPU Params
+numberOfCores: 4                              # number of cores for mapping optimization
+mappingProcessInterval: 0.15                  # seconds, regulate mapping frequency
+
+# Surrounding map
+surroundingkeyframeAddingDistThreshold: 1.0   # meters, regulate keyframe adding threshold	选取关键帧的距离阈值
+surroundingkeyframeAddingAngleThreshold: 0.2  # radians, regulate keyframe adding threshold	角度阈值
+surroundingKeyframeDensity: 2.0               # meters, downsample surrounding keyframe poses   no_used
+surroundingKeyframeSearchRadius: 50.0         # meters, within n meters scan-to-map optimization (when loop closure disabled) no_used
+
+# Loop closure
+loopClosureEnableFlag: true
+loopClosureFrequency: 4.0                     # Hz, regulate loop closure constraint add frequency
+surroundingKeyframeSize: 50                   # submap size (when loop closure enabled)
+historyKeyframeSearchRadius: 20.0            # meters, key frame that is within n meters from current pose will be considerd for loop closure
+historyKeyframeSearchTimeDiff: 30.0           # seconds, key frame that is n seconds older will be considered for loop closure
+historyKeyframeSearchNum: 25                  # number of hostory key frames will be fused into a submap for loop closure
+historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
+
+# GPS Settings
+useImuHeadingInitialization: true           # align GNSS local frame to SLAM first-frame using ENU IMU heading
+useGpsElevation: true                       # RTK usually has usable elevation
+gpsCovThreshold: 0.2                        # m^2, stricter gate for RTK 值越小，过滤越严格，进图优化的 GNSS 点越少越干净，GNSS影响越弱
+poseCovThreshold: 8.0                         # 0 means always allow GPS correction by covariance gate 值越大，越不容易触发 GNSS 约束，GNSS影响越弱
+
+# GNSS robust settings (RTK + ENU)
+gnssCoordinateSystem: ENU                   # GeographicLib output for NavSatFix should be treated as ENU
+gnssYawOffsetDeg: 0.0                       # fallback only when useImuHeadingInitialization=false
+gnssInvertX: false                          # fallback only when useImuHeadingInitialization=false
+gnssInvertY: false                          # fallback only when useImuHeadingInitialization=false
+gnssTimeAlignWindow: 0.10                   # seconds, lidar-gnss nearest match window
+gnssMinVarianceXY: 0.16                    # m^2, lower bound for XY factor variance
+gnssMinVarianceZ: 0.64                      # m^2, lower bound for Z factor variance
+gnssFactorMinDistance: 5.0                 # meters, minimum spacing for GPS factors
+gnssMinFixStatus: 1                         # NavSatStatus: 0(FIX) and above
+gnssRejectUnknownCovariance: true           # skip COVARIANCE_TYPE_UNKNOWN
+gnssEnableVelocityCheck: true               # reject unrealistic GNSS jumps
+gnssMaxValidVelocity: 60.0                  # m/s
+
+
+# Visualization
+globalMapVisualizationSearchRadius: 100.0    # meters, global map visualization radius,  iktree submap 的搜索范围
+globalMapVisualizationPoseDensity: 10      # meters, global map visualization keyframe density
+globalMapVisualizationLeafSize: 1.0           # meters, global map visualization cloud density
+
+# visual iktree_map  
+visulize_IkdtreeMap: true
+
+# visual iktree_map  
+recontructKdTree: true
+
+# Export settings
+savePCD: false                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
+savePCDDirectory: "/"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+

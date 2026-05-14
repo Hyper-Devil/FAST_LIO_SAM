@@ -4,6 +4,24 @@ This fork contains the following modifications on top of the upstream FAST_LIO_S
 
 ---
 
+### 2026-05-14 — `/accumulated_map_points` async 5Hz near-field density
+
+**Goal:** Provide a denser vehicle-local accumulated cloud without reintroducing the main-thread lag previously seen on `/accumulated_map_points`. The effective local horizontal area is now **20 m × 20 m = 400 m²** by default, instead of the older ±20 m CropBox footprint (40 m × 40 m = 1600 m²).
+
+**Fixes applied in `src/laserMapping.cpp` and `config/helios_bistu.yaml`:**
+
+1. **Async accumulated-map worker** — the mapping loop now only snapshots the current undistorted scan and pose into a bounded queue; crop, accumulation, voxel filtering, body-frame conversion, and ROS publishing run in a background thread.
+
+2. **5 Hz publish rate** — `/accumulated_map_points` is throttled by `publish/accum_map_pub_hz` (default `5.0`) instead of running every LiDAR frame. If no one subscribes, the worker clears its cache and does no heavy processing.
+
+3. **Forward-dense / rear-coarse local map** — points are cropped in the latest body frame using configurable ranges (`10 m` forward, `10 m` backward, `±10 m` side, `±3 m` z by default). Forward points (`x >= 0`) use `0.1 m` voxel leaf size; rear points use `0.3 m`.
+
+4. **Point-count degradation** — if the published cloud exceeds `publish/accum_map_max_points` (default `250000`), the worker falls back to a whole-local-cloud `0.3 m` voxel filter and emits a throttled warning.
+
+Build validation: `source /opt/ros/noetic/setup.bash && cd /home/whd/catkin_slam && catkin_make` completed successfully and rebuilt `fastlio_sam_mapping`.
+
+---
+
 ### 2026-04-16 — `/accumulated_map_points` performance fix (voxel + local crop)
 
 **Problem:** The `/accumulated_map_points` topic ran an unbounded VoxelGrid downsampling (0.25 m leaf) and full inverse-transform every LiDAR frame in the main thread. After ~200 s of driving the accumulated cloud grew to ~700 k points, causing the main loop to fall >1 s behind and producing a visible TF lag on `camera_init → body`.
