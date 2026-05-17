@@ -43,9 +43,10 @@ publish:
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    accum_map_leaf_size: 0.3     # voxel leaf size for /accumulated_map_points (m)
 
 pcd_save:
-    pcd_save_en: true
+    pcd_save_en: false
     interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 # voxel filter paprams
@@ -131,4 +132,3 @@ recontructKdTree: true
 # Export settings
 savePCD: false                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
 savePCDDirectory: "/"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
-

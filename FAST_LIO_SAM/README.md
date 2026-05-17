@@ -20,7 +20,7 @@ Notes:
 
 1. `/Odometry` timeout/断流 is intentionally monitored downstream, not by this node.
 2. Diagnostic `values` are for debugging and replay analysis only; production logic should rely on `level`.
-3. Thresholds live under `runtime_health` in the common RS LiDAR configs `config/helios_bistu.yaml` and `config/helios.yaml`. They can be calibrated from a known-good bag by temporarily setting `runtime_health/metrics_log_path: "/tmp/fast_lio_sam_runtime_health.csv"` in the active YAML, then replaying:
+3. Thresholds live under `runtime_health` in every `config/*.yaml` as a safe fallback; the currently used RS LiDAR values were calibrated from `config/helios_bistu.yaml` and copied to the other configs. They can be recalibrated from a known-good bag by temporarily setting `runtime_health/metrics_log_path: "/tmp/fast_lio_sam_runtime_health.csv"` in the active YAML, then replaying:
 
 ```bash
 roslaunch fast_lio_sam mapping_rs_bistu.launch use_sim_time:=true
