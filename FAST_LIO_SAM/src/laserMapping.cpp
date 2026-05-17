@@ -62,6 +62,9 @@
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
 #include <livox_ros_driver2/CustomMsg.h>
+#include <diagnostic_msgs/DiagnosticArray.h>
+#include <diagnostic_msgs/KeyValue.h>
+#include <diagnostic_msgs/DiagnosticStatus.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -193,6 +196,400 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+struct RuntimeHealthConfig
+{
+    bool enable = true;
+    string topic = "/fast_lio_sam/runtime_health_alert";
+    double repeat_active_alert_sec = 5.0;
+    int bad_window_frames = 5;
+    int recover_window_frames = 10;
+    int min_effective_feature_num = 30;
+    double min_effective_feature_ratio = 0.05;
+    double critical_effective_feature_ratio = 0.01;
+    double max_residual_mean_warn = 0.12;
+    double max_residual_mean_error = 0.20;
+    double max_frame_translation = 2.0;
+    double max_frame_yaw = 0.8;
+    double max_implied_speed = 8.0;
+    int flicker_window_frames = 6;
+    double rollback_distance = 0.5;
+    double loop_correction_grace_sec = 2.0;
+    string metrics_log_path = "";
+};
+
+struct RuntimeHealthPoseSample
+{
+    double stamp = 0.0;
+    Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+    double yaw = 0.0;
+};
+
+struct RuntimeHealthMetrics
+{
+    double stamp = 0.0;
+    int effective_feature_num = 0;
+    int feats_down_size = 0;
+    double effective_feature_ratio = 0.0;
+    double residual_mean = 0.0;
+    double delta_translation = 0.0;
+    double delta_yaw = 0.0;
+    double implied_speed = 0.0;
+    double pose_cov_trace_xyz = 0.0;
+    double pose_cov_max_xyz = 0.0;
+    bool loop_correction_active = false;
+};
+
+static double normalizeAngle(double angle)
+{
+    while (angle > M_PI)
+        angle -= 2.0 * M_PI;
+    while (angle < -M_PI)
+        angle += 2.0 * M_PI;
+    return angle;
+}
+
+static string boolToString(bool value)
+{
+    return value ? "true" : "false";
+}
+
+static string doubleToString(double value, int precision = 6)
+{
+    std::ostringstream oss;
+    oss << fixed << setprecision(precision) << value;
+    return oss.str();
+}
+
+class RuntimeHealthMonitor
+{
+public:
+    void configure(const ros::NodeHandle &nh)
+    {
+        nh.param<bool>("runtime_health/enable", cfg_.enable, true);
+        nh.param<string>("runtime_health/topic", cfg_.topic, string("/fast_lio_sam/runtime_health_alert"));
+        nh.param<double>("runtime_health/repeat_active_alert_sec", cfg_.repeat_active_alert_sec, 5.0);
+        nh.param<int>("runtime_health/bad_window_frames", cfg_.bad_window_frames, 5);
+        nh.param<int>("runtime_health/recover_window_frames", cfg_.recover_window_frames, 10);
+        nh.param<int>("runtime_health/min_effective_feature_num", cfg_.min_effective_feature_num, 30);
+        nh.param<double>("runtime_health/min_effective_feature_ratio", cfg_.min_effective_feature_ratio, 0.05);
+        nh.param<double>("runtime_health/critical_effective_feature_ratio", cfg_.critical_effective_feature_ratio, 0.01);
+        nh.param<double>("runtime_health/max_residual_mean_warn", cfg_.max_residual_mean_warn, 0.12);
+        nh.param<double>("runtime_health/max_residual_mean_error", cfg_.max_residual_mean_error, 0.20);
+        nh.param<double>("runtime_health/max_frame_translation", cfg_.max_frame_translation, 2.0);
+        nh.param<double>("runtime_health/max_frame_yaw", cfg_.max_frame_yaw, 0.8);
+        nh.param<double>("runtime_health/max_implied_speed", cfg_.max_implied_speed, 8.0);
+        nh.param<int>("runtime_health/flicker_window_frames", cfg_.flicker_window_frames, 6);
+        nh.param<double>("runtime_health/rollback_distance", cfg_.rollback_distance, 0.5);
+        nh.param<double>("runtime_health/loop_correction_grace_sec", cfg_.loop_correction_grace_sec, 2.0);
+        nh.param<string>("runtime_health/metrics_log_path", cfg_.metrics_log_path, string(""));
+
+        cfg_.bad_window_frames = std::max(1, cfg_.bad_window_frames);
+        cfg_.recover_window_frames = std::max(1, cfg_.recover_window_frames);
+        cfg_.flicker_window_frames = std::max(3, cfg_.flicker_window_frames);
+
+        if (!cfg_.metrics_log_path.empty())
+        {
+            metrics_log_.open(cfg_.metrics_log_path.c_str(), ios::out);
+            if (metrics_log_)
+            {
+                metrics_log_ << "stamp,effective_feature_num,feats_down_size,effective_feature_ratio,"
+                             << "residual_mean,delta_translation,delta_yaw,implied_speed,"
+                             << "pose_cov_trace_xyz,pose_cov_max_xyz,loop_correction_active\n";
+            }
+            else
+            {
+                ROS_WARN("runtime_health metrics_log_path cannot be opened: %s", cfg_.metrics_log_path.c_str());
+            }
+        }
+    }
+
+    const string &topic() const { return cfg_.topic; }
+
+    void setPublisher(const ros::Publisher &publisher)
+    {
+        publisher_ = publisher;
+    }
+
+    void reportNoPoint(double stamp, int feats_size, int effective_num, double residual_mean, const string &reason)
+    {
+        RuntimeHealthMetrics metrics;
+        metrics.stamp = stamp;
+        metrics.feats_down_size = feats_size;
+        metrics.effective_feature_num = effective_num;
+        metrics.residual_mean = residual_mean;
+        metrics.effective_feature_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        publishOrUpdate(diagnostic_msgs::DiagnosticStatus::ERROR, reason, metrics, true);
+    }
+
+    void updateWithOdom(const nav_msgs::Odometry &odom, int feats_size, int effective_num, double residual_mean, bool loop_correction_active)
+    {
+        if (!cfg_.enable)
+            return;
+
+        RuntimeHealthMetrics metrics;
+        metrics.stamp = odom.header.stamp.toSec();
+        metrics.feats_down_size = feats_size;
+        metrics.effective_feature_num = effective_num;
+        metrics.residual_mean = residual_mean;
+        metrics.effective_feature_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        metrics.loop_correction_active = loop_correction_active;
+        metrics.pose_cov_trace_xyz = odom.pose.covariance[0] + odom.pose.covariance[7] + odom.pose.covariance[14];
+        metrics.pose_cov_max_xyz = std::max(odom.pose.covariance[0], std::max(odom.pose.covariance[7], odom.pose.covariance[14]));
+
+        RuntimeHealthPoseSample current;
+        current.stamp = metrics.stamp;
+        current.pos = Eigen::Vector3d(odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z);
+        current.yaw = tf::getYaw(odom.pose.pose.orientation);
+
+        if (loop_correction_active)
+            last_loop_correction_time_ = metrics.stamp;
+
+        if (has_last_pose_)
+        {
+            const double dt = current.stamp - last_pose_.stamp;
+            if (dt > 1e-6)
+            {
+                metrics.delta_translation = (current.pos - last_pose_.pos).norm();
+                metrics.delta_yaw = fabs(normalizeAngle(current.yaw - last_pose_.yaw));
+                metrics.implied_speed = metrics.delta_translation / dt;
+            }
+        }
+
+        int level = diagnostic_msgs::DiagnosticStatus::OK;
+        vector<string> reasons;
+        const bool low_feature_num = effective_num < cfg_.min_effective_feature_num;
+        const bool low_feature_ratio = metrics.effective_feature_ratio < cfg_.min_effective_feature_ratio;
+        const bool critical_feature_ratio = metrics.effective_feature_ratio < cfg_.critical_effective_feature_ratio;
+        const bool high_residual_warn = residual_mean > cfg_.max_residual_mean_warn;
+        const bool high_residual_error = residual_mean > cfg_.max_residual_mean_error;
+        const bool in_loop_grace = isInLoopGrace(metrics.stamp);
+
+        if (feats_size < 5)
+        {
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+            reasons.push_back("FEATS_DOWN_TOO_LOW");
+        }
+        if (effective_num < 1)
+        {
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+            reasons.push_back("NO_EFFECTIVE_POINTS");
+        }
+
+        const bool degraded = low_feature_num || low_feature_ratio || high_residual_warn;
+        if (degraded)
+        {
+            bad_frame_count_++;
+            if (low_feature_num)
+                reasons.push_back("LOW_EFFECTIVE_FEATURE_NUM");
+            if (low_feature_ratio)
+                reasons.push_back("LOW_EFFECTIVE_FEATURE_RATIO");
+            if (high_residual_warn)
+                reasons.push_back("HIGH_RESIDUAL");
+        }
+        else
+        {
+            bad_frame_count_ = 0;
+        }
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && level < diagnostic_msgs::DiagnosticStatus::WARN)
+            level = diagnostic_msgs::DiagnosticStatus::WARN;
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && (critical_feature_ratio || high_residual_error || ((low_feature_num || low_feature_ratio) && high_residual_warn)))
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+
+        const bool pose_jump = has_last_pose_ &&
+                               (metrics.delta_translation > cfg_.max_frame_translation ||
+                                metrics.delta_yaw > cfg_.max_frame_yaw ||
+                                metrics.implied_speed > cfg_.max_implied_speed);
+        if (pose_jump)
+        {
+            reasons.push_back(in_loop_grace ? "POSE_JUMP_SUPPRESSED_BY_LOOP_CORRECTION" : "POSE_JUMP");
+            if (!in_loop_grace)
+                level = diagnostic_msgs::DiagnosticStatus::ERROR;
+        }
+
+        if (updateFlickerState(current))
+        {
+            reasons.push_back("POSE_FLICKER_OR_ROLLBACK");
+            level = std::max(level, flicker_error_ ? static_cast<int>(diagnostic_msgs::DiagnosticStatus::ERROR)
+                                                   : static_cast<int>(diagnostic_msgs::DiagnosticStatus::WARN));
+        }
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && high_residual_warn && (low_feature_num || low_feature_ratio) && !in_loop_grace)
+        {
+            reasons.push_back("MAP_OVERLAP_RISK");
+            level = std::max(level, static_cast<int>(diagnostic_msgs::DiagnosticStatus::WARN));
+        }
+
+        logMetrics(metrics);
+        last_pose_ = current;
+        has_last_pose_ = true;
+
+        if (reasons.empty())
+            reasons.push_back("OK");
+        publishOrUpdate(level, joinReasons(reasons), metrics, false);
+    }
+
+private:
+    bool isInLoopGrace(double stamp) const
+    {
+        return last_loop_correction_time_ > 0.0 && (stamp - last_loop_correction_time_) <= cfg_.loop_correction_grace_sec;
+    }
+
+    bool updateFlickerState(const RuntimeHealthPoseSample &current)
+    {
+        pose_window_.push_back(current);
+        while (static_cast<int>(pose_window_.size()) > cfg_.flicker_window_frames)
+            pose_window_.pop_front();
+
+        flicker_error_ = false;
+        if (pose_window_.size() < 3)
+            return false;
+
+        int flips = 0;
+        for (size_t i = 2; i < pose_window_.size(); ++i)
+        {
+            Eigen::Vector3d prev = pose_window_[i - 1].pos - pose_window_[i - 2].pos;
+            Eigen::Vector3d curr = pose_window_[i].pos - pose_window_[i - 1].pos;
+            const double prev_norm = prev.norm();
+            const double curr_norm = curr.norm();
+            if (prev_norm < cfg_.rollback_distance || curr_norm < cfg_.rollback_distance)
+                continue;
+            const double cos_angle = prev.dot(curr) / (prev_norm * curr_norm);
+            if (cos_angle < -0.5)
+                flips++;
+        }
+
+        if (flips <= 0)
+            return false;
+
+        flicker_error_ = flips >= 2;
+        return true;
+    }
+
+    void publishOrUpdate(int level, const string &reason, const RuntimeHealthMetrics &metrics, bool immediate)
+    {
+        if (!cfg_.enable || publisher_.getTopic().empty())
+            return;
+
+        const double now = metrics.stamp > 0.0 ? metrics.stamp : ros::Time::now().toSec();
+        if (level == diagnostic_msgs::DiagnosticStatus::OK)
+        {
+            bad_recover_count_++;
+            if (last_level_ == diagnostic_msgs::DiagnosticStatus::OK || bad_recover_count_ < cfg_.recover_window_frames)
+                return;
+            publishStatus(diagnostic_msgs::DiagnosticStatus::OK, "RECOVER", reason, metrics);
+            last_level_ = diagnostic_msgs::DiagnosticStatus::OK;
+            last_publish_time_ = now;
+            return;
+        }
+
+        bad_recover_count_ = 0;
+        const bool first_alarm = last_level_ == diagnostic_msgs::DiagnosticStatus::OK;
+        const bool upgrade = level > last_level_;
+        const bool repeat = last_publish_time_ <= 0.0 || (now - last_publish_time_) >= cfg_.repeat_active_alert_sec;
+        if (!immediate && !first_alarm && !upgrade && !repeat)
+        {
+            last_level_ = std::max(last_level_, level);
+            return;
+        }
+
+        const string action = first_alarm ? "TRIGGER" : (upgrade ? "UPGRADE" : "REPEAT");
+        publishStatus(level, action, reason, metrics);
+        last_level_ = std::max(last_level_, level);
+        last_publish_time_ = now;
+    }
+
+    void publishStatus(int level, const string &action, const string &reason, const RuntimeHealthMetrics &metrics)
+    {
+        diagnostic_msgs::DiagnosticArray array_msg;
+        array_msg.header.stamp = metrics.stamp > 0.0 ? ros::Time().fromSec(metrics.stamp) : ros::Time::now();
+        array_msg.header.frame_id = "camera_init";
+
+        diagnostic_msgs::DiagnosticStatus status;
+        status.level = level;
+        status.name = "fast_lio_sam/runtime_health";
+        status.hardware_id = "fast_lio_sam_mapping";
+        status.message = action + ": " + reason;
+        addValue(status, "schema_version", "1");
+        addValue(status, "event_action", action);
+        addValue(status, "reason_flags", reason);
+        addValue(status, "effective_feature_num", std::to_string(metrics.effective_feature_num));
+        addValue(status, "feats_down_size", std::to_string(metrics.feats_down_size));
+        addValue(status, "effective_feature_ratio", doubleToString(metrics.effective_feature_ratio));
+        addValue(status, "residual_mean", doubleToString(metrics.residual_mean));
+        addValue(status, "delta_translation", doubleToString(metrics.delta_translation));
+        addValue(status, "delta_yaw", doubleToString(metrics.delta_yaw));
+        addValue(status, "implied_speed", doubleToString(metrics.implied_speed));
+        addValue(status, "pose_cov_trace_xyz", doubleToString(metrics.pose_cov_trace_xyz));
+        addValue(status, "pose_cov_max_xyz", doubleToString(metrics.pose_cov_max_xyz));
+        addValue(status, "loop_correction_active", boolToString(metrics.loop_correction_active));
+        addValue(status, "bad_frame_count", std::to_string(bad_frame_count_));
+        addValue(status, "thresholds",
+                 "min_feat=" + std::to_string(cfg_.min_effective_feature_num) +
+                     ",min_ratio=" + doubleToString(cfg_.min_effective_feature_ratio) +
+                     ",crit_ratio=" + doubleToString(cfg_.critical_effective_feature_ratio) +
+                     ",res_warn=" + doubleToString(cfg_.max_residual_mean_warn) +
+                     ",res_error=" + doubleToString(cfg_.max_residual_mean_error));
+
+        array_msg.status.push_back(status);
+        publisher_.publish(array_msg);
+    }
+
+    void addValue(diagnostic_msgs::DiagnosticStatus &status, const string &key, const string &value)
+    {
+        diagnostic_msgs::KeyValue item;
+        item.key = key;
+        item.value = value;
+        status.values.push_back(item);
+    }
+
+    string joinReasons(const vector<string> &reasons) const
+    {
+        string joined;
+        for (size_t i = 0; i < reasons.size(); ++i)
+        {
+            if (i > 0)
+                joined += "|";
+            joined += reasons[i];
+        }
+        return joined;
+    }
+
+    void logMetrics(const RuntimeHealthMetrics &metrics)
+    {
+        if (!metrics_log_)
+            return;
+        metrics_log_ << fixed << setprecision(6)
+                     << metrics.stamp << ","
+                     << metrics.effective_feature_num << ","
+                     << metrics.feats_down_size << ","
+                     << metrics.effective_feature_ratio << ","
+                     << metrics.residual_mean << ","
+                     << metrics.delta_translation << ","
+                     << metrics.delta_yaw << ","
+                     << metrics.implied_speed << ","
+                     << metrics.pose_cov_trace_xyz << ","
+                     << metrics.pose_cov_max_xyz << ","
+                     << (metrics.loop_correction_active ? 1 : 0) << "\n";
+    }
+
+    RuntimeHealthConfig cfg_;
+    ros::Publisher publisher_;
+    ofstream metrics_log_;
+    RuntimeHealthPoseSample last_pose_;
+    bool has_last_pose_ = false;
+    deque<RuntimeHealthPoseSample> pose_window_;
+    int bad_frame_count_ = 0;
+    int bad_recover_count_ = 0;
+    int last_level_ = diagnostic_msgs::DiagnosticStatus::OK;
+    double last_publish_time_ = 0.0;
+    double last_loop_correction_time_ = -1.0;
+    bool flicker_error_ = false;
+};
+
+RuntimeHealthMonitor runtime_health_monitor;
 
 /*back end*/
 vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样）
@@ -2507,6 +2904,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
+        runtime_health_monitor.reportNoPoint(lidar_end_time, feats_down_size, effct_feat_num, res_mean_last, "NO_EFFECTIVE_POINTS");
         ROS_WARN("No Effective Points! \n");
         return;
     }
@@ -2608,6 +3006,7 @@ int main(int argc, char **argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    runtime_health_monitor.configure(nh);
     cout << "p_pre->lidar_type " << p_pre->lidar_type << endl;
 
     nh.param<float>("odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
@@ -2771,6 +3170,8 @@ int main(int argc, char **argv)
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", kPointCloudPubQueueSize);         //  no used
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", kPointCloudPubQueueSize);                    //  no used
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", kOdomPubQueueSize);
+    ros::Publisher pubRuntimeHealth = nh.advertise<diagnostic_msgs::DiagnosticArray>(runtime_health_monitor.topic(), 10);
+    runtime_health_monitor.setPublisher(pubRuntimeHealth);
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", kPathPubQueueSize);
 
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", kPathPubQueueSize);                   //  isam更新后的path
@@ -2878,6 +3279,7 @@ int main(int argc, char **argv)
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
+                runtime_health_monitor.reportNoPoint(lidar_end_time, feats_down_size, effct_feat_num, res_mean_last, "FEATS_DOWN_TOO_LOW");
                 ROS_WARN("No point, skip this scan!\n");
                 continue;
             }
@@ -2928,10 +3330,12 @@ int main(int argc, char **argv)
             // 4.得到当前帧优化后的位姿，位姿协方差
             // 5.添加cloudKeyPoses3D，cloudKeyPoses6D，更新transformTobeMapped，添加当前关键帧的角点、平面点集合
             saveKeyFramesAndFactor();
+            bool runtime_health_loop_correction = aLoopIsClosed;
             // 更新因子图中所有变量节点的位姿，也就是所有历史关键帧的位姿，更新里程计轨迹， 重构ikdtree
             correctPoses();
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            runtime_health_monitor.updateWithOdom(odomAftMapped, feats_down_size, effct_feat_num, res_mean_last, runtime_health_loop_correction);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();

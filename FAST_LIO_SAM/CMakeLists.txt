@@ -46,6 +46,7 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
   sensor_msgs
+  diagnostic_msgs
   roscpp
   rospy
   std_msgs
@@ -150,7 +151,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
+  CATKIN_DEPENDS geometry_msgs nav_msgs sensor_msgs diagnostic_msgs roscpp rospy std_msgs message_runtime
   DEPENDS EIGEN3 PCL GTSAM
   INCLUDE_DIRS
 )

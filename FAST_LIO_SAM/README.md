@@ -4,6 +4,34 @@ This fork contains the following modifications on top of the upstream FAST_LIO_S
 
 ---
 
+### 2026-05-16 — Runtime health alert topic
+
+Added runtime health alerts from `fastlio_sam_mapping` on `/fast_lio_sam/runtime_health_alert` using `diagnostic_msgs/DiagnosticArray`.
+
+Downstream consumers only need to parse the highest `DiagnosticStatus.level`:
+
+| Level | Meaning | Downstream action |
+|---|---|---|
+| `0` (`OK`) | Recovered after a previous warning/error. | Clear the active SLAM health alarm. |
+| `1` (`WARN`) | Degraded scan-to-map alignment or pose stability risk. | Mark SLAM as risky but still publishing. |
+| `2` (`ERROR`) | Tracking lost, severe pose jump/flicker/rollback, or strong map-overlap risk. | Treat SLAM output as unhealthy. |
+
+Notes:
+
+1. `/Odometry` timeout/断流 is intentionally monitored downstream, not by this node.
+2. Diagnostic `values` are for debugging and replay analysis only; production logic should rely on `level`.
+3. Thresholds live under `runtime_health` in the common RS LiDAR configs `config/helios_bistu.yaml` and `config/helios.yaml`. They can be calibrated from a known-good bag by temporarily setting `runtime_health/metrics_log_path: "/tmp/fast_lio_sam_runtime_health.csv"` in the active YAML, then replaying:
+
+```bash
+roslaunch fast_lio_sam mapping_rs_bistu.launch use_sim_time:=true
+rosbag play --clock /media/whd/ITGZ_NOFAN/USED_ROSBAG_2512/2025-08-30-16-00-21.bag
+python3 scripts/calibrate_runtime_health.py /tmp/fast_lio_sam_runtime_health.csv
+```
+
+The current RS LiDAR thresholds were calibrated from the normal bag above, then relaxed to `max_residual_mean_error: 0.250022` for short residual spikes. A runtime alert such as `HIGH_RESIDUAL|POSE_JUMP` with `level=2` is expected when RViz shows a real short SLAM interruption: residual above WARN is a context flag, while the ERROR is caused by pose jump metrics exceeding the calibrated translation/yaw/speed limits.
+
+---
+
 ### 2026-05-14 — `/accumulated_map_points` async 5Hz near-field density
 
 **Goal:** Provide a denser vehicle-local accumulated cloud without reintroducing the main-thread lag previously seen on `/accumulated_map_points`. The effective local horizontal area is now **20 m × 20 m = 400 m²** by default, instead of the older ±20 m CropBox footprint (40 m × 40 m = 1600 m²).
