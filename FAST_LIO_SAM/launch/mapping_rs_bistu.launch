@@ -48,10 +48,7 @@
       args=" -0.6 0 -0.88 0 0 0 body base_link 100" />
 
     <node pkg="tf" type="static_transform_publisher" name="body_to_cam_left" 
-      args="0.24318827 0.0158984 -0.07570929 -1.57399577 0.00480665 -1.54805221 body cam_left 10" />
-
-    <node pkg="tf" type="static_transform_publisher" name="body_to_hikrobot_camera" 
-      args="0.24318827 0.0158984 -0.07570929 -1.57399577 0.00480665 -1.54805221 body hikrobot_camera 10" />
+      args="0.26716177 0.01911911 -0.11095841 -1.51792668 -0.01551277 -1.59640287 body cam_left 10" />
 
     <node pkg="tf" type="static_transform_publisher" name="body_to_imu_link" 
       args="0.07753 0.02948 -0.12965 0.07610 0.00900 3.11989 body imu_link 10" />

@@ -28,8 +28,6 @@ rosbag play --clock /media/whd/ITGZ_NOFAN/USED_ROSBAG_2512/2025-08-30-16-00-21.b
 python3 scripts/calibrate_runtime_health.py /tmp/fast_lio_sam_runtime_health.csv
 ```
 
-The current RS LiDAR thresholds were calibrated from the normal bag above, then relaxed to `max_residual_mean_error: 0.250022` for short residual spikes. A runtime alert such as `HIGH_RESIDUAL|POSE_JUMP` with `level=2` is expected when RViz shows a real short SLAM interruption: residual above WARN is a context flag, while the ERROR is caused by pose jump metrics exceeding the calibrated translation/yaw/speed limits.
-
 ---
 
 ### 2026-05-14 — `/accumulated_map_points` async 5Hz near-field density
