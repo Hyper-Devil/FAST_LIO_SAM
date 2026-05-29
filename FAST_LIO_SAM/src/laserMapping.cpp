@@ -296,6 +296,7 @@ public:
                 metrics_log_ << "stamp,effective_feature_num,feats_down_size,effective_feature_ratio,"
                              << "residual_mean,delta_translation,delta_yaw,implied_speed,"
                              << "pose_cov_trace_xyz,pose_cov_max_xyz,loop_correction_active\n";
+                metrics_log_.flush();
             }
             else
             {
@@ -573,6 +574,7 @@ private:
                      << metrics.pose_cov_trace_xyz << ","
                      << metrics.pose_cov_max_xyz << ","
                      << (metrics.loop_correction_active ? 1 : 0) << "\n";
+        metrics_log_.flush();
     }
 
     RuntimeHealthConfig cfg_;
@@ -590,6 +592,205 @@ private:
 };
 
 RuntimeHealthMonitor runtime_health_monitor;
+
+struct CalibrationStatusConfig
+{
+    bool enable = false;
+    string topic = "/fast_lio_sam/calibration_status";
+    string log_path = "";
+    double publish_period = 1.0;
+    double stability_window_sec = 10.0;
+};
+
+struct CalibrationStatusSample
+{
+    double stamp = 0.0;
+    Eigen::Vector3d ext_rpy_deg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d ext_t = Eigen::Vector3d::Zero();
+};
+
+class CalibrationStatusMonitor
+{
+public:
+    void configure(const ros::NodeHandle &nh)
+    {
+        nh.param<bool>("calibration_status/enable", cfg_.enable, false);
+        nh.param<string>("calibration_status/topic", cfg_.topic, string("/fast_lio_sam/calibration_status"));
+        nh.param<string>("calibration_status/log_path", cfg_.log_path, string(""));
+        nh.param<double>("calibration_status/publish_period", cfg_.publish_period, 1.0);
+        nh.param<double>("calibration_status/stability_window_sec", cfg_.stability_window_sec, 10.0);
+
+        cfg_.publish_period = std::max(0.1, cfg_.publish_period);
+        cfg_.stability_window_sec = std::max(1.0, cfg_.stability_window_sec);
+
+        if (!cfg_.log_path.empty())
+        {
+            log_.open(cfg_.log_path.c_str(), ios::out);
+            if (log_)
+            {
+                log_ << "stamp,relative_time,time_diff_lidar_wrt_imu,"
+                     << "ext_roll_deg,ext_pitch_deg,ext_yaw_deg,ext_x,ext_y,ext_z,"
+                     << "ext_roll_sigma_deg,ext_pitch_sigma_deg,ext_yaw_sigma_deg,"
+                     << "ext_x_sigma,ext_y_sigma,ext_z_sigma,"
+                     << "window_rot_drift_deg,window_trans_drift,"
+                     << "effective_feature_num,feats_down_size,effective_feature_ratio,residual_mean\n";
+                log_.flush();
+            }
+            else
+            {
+                ROS_WARN("calibration_status log_path cannot be opened: %s", cfg_.log_path.c_str());
+            }
+        }
+    }
+
+    const string &topic() const { return cfg_.topic; }
+
+    void setPublisher(const ros::Publisher &publisher)
+    {
+        publisher_ = publisher;
+    }
+
+    void update(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                const state_ikfom &state, const esekfom::esekf<state_ikfom, 12, input_ikfom>::cov &P,
+                int effective_num, int feats_size, double residual_mean)
+    {
+        if (!cfg_.enable)
+            return;
+
+        CalibrationStatusSample sample;
+        sample.stamp = stamp;
+        vect3 ext_euler = SO3ToEuler(state.offset_R_L_I);
+        sample.ext_rpy_deg = Eigen::Vector3d(ext_euler(0), ext_euler(1), ext_euler(2));
+        sample.ext_t = Eigen::Vector3d(state.offset_T_L_I(0), state.offset_T_L_I(1), state.offset_T_L_I(2));
+        samples_.push_back(sample);
+        while (!samples_.empty() && stamp - samples_.front().stamp > cfg_.stability_window_sec)
+            samples_.pop_front();
+
+        const double effective_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        const Eigen::Vector3d ext_rot_sigma_deg(safeSigma(P(6, 6)) * 57.3,
+                                                safeSigma(P(7, 7)) * 57.3,
+                                                safeSigma(P(8, 8)) * 57.3);
+        const Eigen::Vector3d ext_t_sigma(safeSigma(P(9, 9)),
+                                          safeSigma(P(10, 10)),
+                                          safeSigma(P(11, 11)));
+
+        double window_rot_drift_deg = 0.0;
+        double window_trans_drift = 0.0;
+        if (!samples_.empty())
+        {
+            window_rot_drift_deg = (sample.ext_rpy_deg - samples_.front().ext_rpy_deg).norm();
+            window_trans_drift = (sample.ext_t - samples_.front().ext_t).norm();
+        }
+
+        logCsv(stamp, relative_time, timediff_lidar_wrt_imu, sample, ext_rot_sigma_deg, ext_t_sigma,
+               window_rot_drift_deg, window_trans_drift, effective_num, feats_size, effective_ratio, residual_mean);
+
+        if (stamp - last_publish_stamp_ < cfg_.publish_period)
+            return;
+
+        last_publish_stamp_ = stamp;
+        publishStatus(stamp, relative_time, timediff_lidar_wrt_imu, sample, ext_rot_sigma_deg, ext_t_sigma,
+                      window_rot_drift_deg, window_trans_drift, effective_num, feats_size, effective_ratio, residual_mean);
+    }
+
+private:
+    double safeSigma(double variance) const
+    {
+        return variance > 0.0 && std::isfinite(variance) ? std::sqrt(variance) : 0.0;
+    }
+
+    void addValue(diagnostic_msgs::DiagnosticStatus &status, const string &key, const string &value)
+    {
+        diagnostic_msgs::KeyValue item;
+        item.key = key;
+        item.value = value;
+        status.values.push_back(item);
+    }
+
+    void logCsv(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                const CalibrationStatusSample &sample, const Eigen::Vector3d &ext_rot_sigma_deg,
+                const Eigen::Vector3d &ext_t_sigma, double window_rot_drift_deg, double window_trans_drift,
+                int effective_num, int feats_size, double effective_ratio, double residual_mean)
+    {
+        if (!log_)
+            return;
+
+        log_ << fixed << setprecision(9)
+             << stamp << ","
+             << relative_time << ","
+             << timediff_lidar_wrt_imu << ","
+             << sample.ext_rpy_deg(0) << ","
+             << sample.ext_rpy_deg(1) << ","
+             << sample.ext_rpy_deg(2) << ","
+             << sample.ext_t(0) << ","
+             << sample.ext_t(1) << ","
+             << sample.ext_t(2) << ","
+             << ext_rot_sigma_deg(0) << ","
+             << ext_rot_sigma_deg(1) << ","
+             << ext_rot_sigma_deg(2) << ","
+             << ext_t_sigma(0) << ","
+             << ext_t_sigma(1) << ","
+             << ext_t_sigma(2) << ","
+             << window_rot_drift_deg << ","
+             << window_trans_drift << ","
+             << effective_num << ","
+             << feats_size << ","
+             << effective_ratio << ","
+             << residual_mean << "\n";
+        log_.flush();
+    }
+
+    void publishStatus(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                       const CalibrationStatusSample &sample, const Eigen::Vector3d &ext_rot_sigma_deg,
+                       const Eigen::Vector3d &ext_t_sigma, double window_rot_drift_deg, double window_trans_drift,
+                       int effective_num, int feats_size, double effective_ratio, double residual_mean)
+    {
+        if (publisher_.getTopic().empty())
+            return;
+
+        diagnostic_msgs::DiagnosticArray array_msg;
+        array_msg.header.stamp = stamp > 0.0 ? ros::Time().fromSec(stamp) : ros::Time::now();
+        array_msg.header.frame_id = "body";
+
+        diagnostic_msgs::DiagnosticStatus status;
+        status.level = diagnostic_msgs::DiagnosticStatus::OK;
+        status.name = "fast_lio_sam/calibration_status";
+        status.hardware_id = "fast_lio_sam_mapping";
+        status.message = "ONLINE_EXTRINSIC_STATUS";
+        addValue(status, "schema_version", "1");
+        addValue(status, "relative_time", doubleToString(relative_time, 6));
+        addValue(status, "time_diff_lidar_wrt_imu", doubleToString(timediff_lidar_wrt_imu, 9));
+        addValue(status, "ext_rpy_deg", doubleToString(sample.ext_rpy_deg(0), 9) + "," +
+                                         doubleToString(sample.ext_rpy_deg(1), 9) + "," +
+                                         doubleToString(sample.ext_rpy_deg(2), 9));
+        addValue(status, "ext_t", doubleToString(sample.ext_t(0), 9) + "," +
+                                  doubleToString(sample.ext_t(1), 9) + "," +
+                                  doubleToString(sample.ext_t(2), 9));
+        addValue(status, "ext_rpy_sigma_deg", doubleToString(ext_rot_sigma_deg(0), 9) + "," +
+                                               doubleToString(ext_rot_sigma_deg(1), 9) + "," +
+                                               doubleToString(ext_rot_sigma_deg(2), 9));
+        addValue(status, "ext_t_sigma", doubleToString(ext_t_sigma(0), 9) + "," +
+                                        doubleToString(ext_t_sigma(1), 9) + "," +
+                                        doubleToString(ext_t_sigma(2), 9));
+        addValue(status, "window_rot_drift_deg", doubleToString(window_rot_drift_deg, 9));
+        addValue(status, "window_trans_drift", doubleToString(window_trans_drift, 9));
+        addValue(status, "effective_feature_num", std::to_string(effective_num));
+        addValue(status, "feats_down_size", std::to_string(feats_size));
+        addValue(status, "effective_feature_ratio", doubleToString(effective_ratio, 9));
+        addValue(status, "residual_mean", doubleToString(residual_mean, 9));
+
+        array_msg.status.push_back(status);
+        publisher_.publish(array_msg);
+    }
+
+    CalibrationStatusConfig cfg_;
+    ros::Publisher publisher_;
+    ofstream log_;
+    deque<CalibrationStatusSample> samples_;
+    double last_publish_stamp_ = -std::numeric_limits<double>::infinity();
+};
+
+CalibrationStatusMonitor calibration_status_monitor;
 
 /*back end*/
 vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样）
@@ -3007,6 +3208,7 @@ int main(int argc, char **argv)
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     runtime_health_monitor.configure(nh);
+    calibration_status_monitor.configure(nh);
     cout << "p_pre->lidar_type " << p_pre->lidar_type << endl;
 
     nh.param<float>("odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
@@ -3172,6 +3374,8 @@ int main(int argc, char **argv)
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", kOdomPubQueueSize);
     ros::Publisher pubRuntimeHealth = nh.advertise<diagnostic_msgs::DiagnosticArray>(runtime_health_monitor.topic(), 10);
     runtime_health_monitor.setPublisher(pubRuntimeHealth);
+    ros::Publisher pubCalibrationStatus = nh.advertise<diagnostic_msgs::DiagnosticArray>(calibration_status_monitor.topic(), 10);
+    calibration_status_monitor.setPublisher(pubCalibrationStatus);
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", kPathPubQueueSize);
 
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", kPathPubQueueSize);                   //  isam更新后的path
@@ -3336,6 +3540,9 @@ int main(int argc, char **argv)
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
             runtime_health_monitor.updateWithOdom(odomAftMapped, feats_down_size, effct_feat_num, res_mean_last, runtime_health_loop_correction);
+            calibration_status_monitor.update(lidar_end_time, Measures.lidar_beg_time - first_lidar_time,
+                                              timediff_lidar_wrt_imu, state_point, kf.get_P(),
+                                              effct_feat_num, feats_down_size, res_mean_last);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();

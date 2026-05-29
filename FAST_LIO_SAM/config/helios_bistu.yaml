@@ -123,6 +123,14 @@ runtime_health:
     # Leave empty in production to avoid per-frame file IO.
     metrics_log_path: ""
 
+calibration_status:
+    enable: false
+    topic: "/fast_lio_sam/calibration_status"
+    publish_period: 1.0
+    stability_window_sec: 10.0
+    # Optional CSV for online extrinsic selection. Override from launch for batch tests.
+    log_path: ""
+
 # Visualization
 globalMapVisualizationSearchRadius: 100.0    # meters, global map visualization radius,  iktree submap 的搜索范围
 globalMapVisualizationPoseDensity: 10      # meters, global map visualization keyframe density

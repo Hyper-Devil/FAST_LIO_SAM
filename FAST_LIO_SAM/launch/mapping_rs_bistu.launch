@@ -12,12 +12,17 @@
     <arg name="gnss_yaw_offset_deg" default="0.0" />
     <arg name="gnss_invert_x" default="false" />
     <arg name="gnss_invert_y" default="false" />
+    <arg name="runtime_pos_log_enable" default="0" />
+    <arg name="runtime_metrics_log_path" default="" />
+    <arg name="calibration_status_log_path" default="" />
 
     <rosparam command="load" file="$(find fast_lio_sam)/config/helios_bistu.yaml" />
     <param name="gnssCoordinateSystem" type="str" value="$(arg gnss_coordinate_system)" />
     <param name="gnssYawOffsetDeg" type="double" value="$(arg gnss_yaw_offset_deg)" />
     <param name="gnssInvertX" type="bool" value="$(arg gnss_invert_x)" />
     <param name="gnssInvertY" type="bool" value="$(arg gnss_invert_y)" />
+    <param name="runtime_health/metrics_log_path" type="str" value="$(arg runtime_metrics_log_path)" />
+    <param name="calibration_status/log_path" type="str" value="$(arg calibration_status_log_path)" />
 
     <param name="feature_extract_enable" type="bool" value="0"/>
     <param name="point_filter_num" type="int" value="4"/>
@@ -26,7 +31,7 @@
     <param name="filter_size_surf" type="double" value="0.5" />
     <param name="filter_size_map" type="double" value="0.5" />
     <param name="cube_side_length" type="double" value="1000" />
-    <param name="runtime_pos_log_enable" type="bool" value="0" />
+    <param name="runtime_pos_log_enable" type="bool" value="$(arg runtime_pos_log_enable)" />
     <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping" output="screen" /> 
 
     <group if="$(arg rviz)">
