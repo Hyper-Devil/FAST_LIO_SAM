@@ -901,7 +901,6 @@ float accum_map_backward_range = 10.0f;
 float accum_map_side_range = 10.0f;
 float accum_map_z_range = 3.0f;
 float accum_map_front_leaf_size = 0.1f;
-float accum_map_rear_leaf_size = 0.3f;
 float accum_map_degraded_leaf_size = 0.3f;
 int accum_map_max_points = 250000;
 
@@ -2475,11 +2474,9 @@ void publishAccumulatedMapThread()
 
         M3D rot_inv = latest_frame.rot.transpose();
         PointCloudXYZI::Ptr cropped_world(new PointCloudXYZI());
-        PointCloudXYZI::Ptr front_body(new PointCloudXYZI());
-        PointCloudXYZI::Ptr rear_body(new PointCloudXYZI());
+        PointCloudXYZI::Ptr local_body(new PointCloudXYZI());
         cropped_world->reserve(accumulated_map_world_cache->size());
-        front_body->reserve(accumulated_map_world_cache->size());
-        rear_body->reserve(accumulated_map_world_cache->size());
+        local_body->reserve(accumulated_map_world_cache->size());
 
         for (const auto &point_world : accumulated_map_world_cache->points)
         {
@@ -2496,23 +2493,13 @@ void publishAccumulatedMapThread()
             point_body.y = p_body_vec(1);
             point_body.z = p_body_vec(2);
             point_body.intensity = point_world.intensity;
-
-            if (p_body_vec(0) >= 0.0)
-                front_body->push_back(point_body);
-            else
-                rear_body->push_back(point_body);
+            local_body->push_back(point_body);
         }
 
         accumulated_map_world_cache->swap(*cropped_world);
 
-        PointCloudXYZI::Ptr front_ds(new PointCloudXYZI());
-        PointCloudXYZI::Ptr rear_ds(new PointCloudXYZI());
-        downsampleAccumulatedCloud(front_body, accum_map_front_leaf_size, front_ds);
-        downsampleAccumulatedCloud(rear_body, accum_map_rear_leaf_size, rear_ds);
-
         PointCloudXYZI::Ptr publish_body(new PointCloudXYZI());
-        *publish_body += *front_ds;
-        *publish_body += *rear_ds;
+        downsampleAccumulatedCloud(local_body, accum_map_front_leaf_size, publish_body);
 
         if (accum_map_max_points > 0 && publish_body->size() > static_cast<size_t>(accum_map_max_points))
         {
@@ -3177,7 +3164,6 @@ int main(int argc, char **argv)
     nh.param<float>("publish/accum_map_side_range", accum_map_side_range, 10.0f);
     nh.param<float>("publish/accum_map_z_range", accum_map_z_range, 3.0f);
     nh.param<float>("publish/accum_map_front_leaf_size", accum_map_front_leaf_size, 0.1f);
-    nh.param<float>("publish/accum_map_rear_leaf_size", accum_map_rear_leaf_size, accum_map_leaf_size);
     nh.param<float>("publish/accum_map_degraded_leaf_size", accum_map_degraded_leaf_size, accum_map_leaf_size);
     nh.param<int>("publish/accum_map_max_points", accum_map_max_points, 250000);
     nh.param<int>("max_iteration", NUM_MAX_ITERATIONS, 4);

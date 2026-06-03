@@ -40,7 +40,7 @@ python3 scripts/calibrate_runtime_health.py /tmp/fast_lio_sam_runtime_health.csv
 
 2. **5 Hz publish rate** — `/accumulated_map_points` is throttled by `publish/accum_map_pub_hz` (default `5.0`) instead of running every LiDAR frame. If no one subscribes, the worker clears its cache and does no heavy processing.
 
-3. **Forward-dense / rear-coarse local map** — points are cropped in the latest body frame using configurable ranges (`10 m` forward, `10 m` backward, `±10 m` side, `±3 m` z by default). Forward points (`x >= 0`) use `0.1 m` voxel leaf size; rear points use `0.3 m`.
+3. **Uniform local-map density** — points are cropped in the latest body frame using configurable ranges (`10 m` forward, `10 m` backward, `±10 m` side, `±3 m` z by default), then voxel-filtered with one local leaf size (`0.1 m` by default) for both `x >= 0` and `x < 0`.
 
 4. **Point-count degradation** — if the published cloud exceeds `publish/accum_map_max_points` (default `250000`), the worker falls back to a whole-local-cloud `0.3 m` voxel filter and emits a throttled warning.
 

@@ -41,14 +41,13 @@ publish:
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
-    accum_map_leaf_size: 0.3     # compatibility default for /accumulated_map_points (m)
+    accum_map_leaf_size: 0.3     # compatibility default for degradation fallback (m)
     accum_map_pub_hz: 5.0        # async publish rate for /accumulated_map_points
     accum_map_forward_range: 10.0
     accum_map_backward_range: 10.0
     accum_map_side_range: 10.0
     accum_map_z_range: 3.0
-    accum_map_front_leaf_size: 0.1
-    accum_map_rear_leaf_size: 0.3
+    accum_map_front_leaf_size: 0.1 # local voxel leaf size for /accumulated_map_points (m)
     accum_map_degraded_leaf_size: 0.3
     accum_map_max_points: 250000
 
