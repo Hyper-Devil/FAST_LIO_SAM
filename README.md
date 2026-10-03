@@ -352,6 +352,20 @@ source /opt/ros/noetic/setup.bash && source /home/ugv/catkin_ws/devel/setup.bash
 - 将冲突处理限定在 fast_lio_sam 工程内（CMake + RPATH）是最稳妥方案。
 - 若后续清理 build/devel 后重编，仍会自动带上该修复。
 
+## /Odometry twist 坐标记录（2026-10-03）
+
+- `laserMapping.cpp` 中的 `state_point.vel` 由世界系转换后再写入
+  `/Odometry.twist.twist.linear`；线速度 3×3 协方差同步执行同一旋转。
+- `twist.angular` 仍直接来自 IMU 陀螺原始读数，坐标轴为 FAST-LIO 的 IMU
+  状态轴；该值尚未扣除滤波器估计的 gyro bias。
+- 当前实现中的线速度与角速度数值都应视为 **IMU 状态轴**。活动
+  `mapping_rs.launch` 还声明了非零 `body -> imu_link` 外参，因此在统一动态
+  odometry 的 child frame、pose 原点和该静态外参前，不能将它们直接解释为
+  `base_link` 参考点的速度。
+
+后续若将 `/Odometry.child_frame_id` 定义为物理 `body/base_link`，必须同时将 pose、
+twist（含角速度 bias 和参考点平移项）统一转换到该 frame，不能只修改线速度列。
+
 ## UpdateLogs:
 
 根据网友的运行和提示，进行了代码的一些bug更新与修改，更新日志如下，欢迎大家多提issues，感谢大家~
