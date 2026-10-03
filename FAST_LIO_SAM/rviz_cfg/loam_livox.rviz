@@ -10,6 +10,7 @@ Panels:
         - /Odometry1/Odometry1/Covariance1
         - /Odometry1/Odometry1/Covariance1/Position1
         - /Odometry1/Odometry1/Covariance1/Orientation1
+        - /Image1
       Splitter Ratio: 0.6431717872619629
     Tree Height: 471
   - Class: rviz/Selection
@@ -29,7 +30,7 @@ Panels:
   - Class: rviz/Time
     Name: Time
     SyncMode: 0
-    SyncSource: currPoints
+    SyncSource: surround
 Preferences:
   PromptSaveOnExit: true
 Toolbars:
@@ -277,8 +278,7 @@ Visualization Manager:
       Marker Topic: /fast_lio_sam/mapping/loop_closure_constraints
       Name: LoopConstraints
       Namespaces:
-        loop_edges: true
-        loop_nodes: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 0.699999988079071
@@ -293,7 +293,7 @@ Visualization Manager:
       Value: false
     - Class: rviz/Image
       Enabled: true
-      Image Topic: /hikrobot_camera/camera_left/image_raw
+      Image Topic: /hikrobot_camera_L/image_raw
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -400,7 +400,7 @@ Visualization Manager:
       Near Clip Distance: 0.009999999776482582
       Pitch: 0.8803982734680176
       Target Frame: base_link
-      Yaw: 0.07539577037096024
+      Yaw: 0.07039576768875122
     Saved: ~
 Window Geometry:
   Displays:

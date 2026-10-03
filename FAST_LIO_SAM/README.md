@@ -4,6 +4,50 @@ This fork contains the following modifications on top of the upstream FAST_LIO_S
 
 ---
 
+### 2026-05-16 — Runtime health alert topic
+
+Added runtime health alerts from `fastlio_sam_mapping` on `/fast_lio_sam/runtime_health_alert` using `diagnostic_msgs/DiagnosticArray`.
+
+Downstream consumers only need to parse the highest `DiagnosticStatus.level`:
+
+| Level | Meaning | Downstream action |
+|---|---|---|
+| `0` (`OK`) | Recovered after a previous warning/error. | Clear the active SLAM health alarm. |
+| `1` (`WARN`) | Degraded scan-to-map alignment or pose stability risk. | Mark SLAM as risky but still publishing. |
+| `2` (`ERROR`) | Tracking lost, severe pose jump/flicker/rollback, or strong map-overlap risk. | Treat SLAM output as unhealthy. |
+
+Notes:
+
+1. `/Odometry` timeout/断流 is intentionally monitored downstream, not by this node.
+2. Diagnostic `values` are for debugging and replay analysis only; production logic should rely on `level`.
+3. Thresholds live under `runtime_health` in every `config/*.yaml` as a safe fallback; the currently used RS LiDAR values were calibrated from `config/helios_bistu.yaml` and copied to the other configs. They can be recalibrated from a known-good bag by temporarily setting `runtime_health/metrics_log_path: "/tmp/fast_lio_sam_runtime_health.csv"` in the active YAML, then replaying:
+
+```bash
+roslaunch fast_lio_sam mapping_rs_bistu.launch use_sim_time:=true
+rosbag play --clock /media/whd/ITGZ_NOFAN/USED_ROSBAG_2512/2025-08-30-16-00-21.bag
+python3 scripts/calibrate_runtime_health.py /tmp/fast_lio_sam_runtime_health.csv
+```
+
+---
+
+### 2026-05-14 — `/accumulated_map_points` async 5Hz near-field density
+
+**Goal:** Provide a denser vehicle-local accumulated cloud without reintroducing the main-thread lag previously seen on `/accumulated_map_points`. The effective local horizontal area is now **20 m × 20 m = 400 m²** by default, instead of the older ±20 m CropBox footprint (40 m × 40 m = 1600 m²).
+
+**Fixes applied in `src/laserMapping.cpp` and `config/helios_bistu.yaml`:**
+
+1. **Async accumulated-map worker** — the mapping loop now only snapshots the current undistorted scan and pose into a bounded queue; crop, accumulation, voxel filtering, body-frame conversion, and ROS publishing run in a background thread.
+
+2. **5 Hz publish rate** — `/accumulated_map_points` is throttled by `publish/accum_map_pub_hz` (default `5.0`) instead of running every LiDAR frame. If no one subscribes, the worker clears its cache and does no heavy processing.
+
+3. **Forward-dense / rear-coarse local map** — points are cropped in the latest body frame using configurable ranges (`10 m` forward, `10 m` backward, `±10 m` side, `±3 m` z by default). Forward points (`x >= 0`) use `0.1 m` voxel leaf size; rear points use `0.3 m`.
+
+4. **Point-count degradation** — if the published cloud exceeds `publish/accum_map_max_points` (default `250000`), the worker falls back to a whole-local-cloud `0.3 m` voxel filter and emits a throttled warning.
+
+Build validation: `source /opt/ros/noetic/setup.bash && cd /home/whd/catkin_slam && catkin_make` completed successfully and rebuilt `fastlio_sam_mapping`.
+
+---
+
 ### 2026-04-16 — `/accumulated_map_points` performance fix (voxel + local crop)
 
 **Problem:** The `/accumulated_map_points` topic ran an unbounded VoxelGrid downsampling (0.25 m leaf) and full inverse-transform every LiDAR frame in the main thread. After ~200 s of driving the accumulated cloud grew to ~700 k points, causing the main loop to fall >1 s behind and producing a visible TF lag on `camera_init → body`.

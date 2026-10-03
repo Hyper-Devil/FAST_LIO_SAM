@@ -2,8 +2,8 @@ common:
     lid_topic:  "/rslidar_points"     #"/velodyne_points"
     imu_topic:  "/imu/data"
     gnss_topic:  "/imu/gpss"         # 不使用
-    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-    time_offset_lidar_to_imu: 0.024263678570373447 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+    time_sync_en: false        # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                   # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
 
     
@@ -14,22 +14,20 @@ preprocess:
     blind: 2
 
 mapping:
-    # acc_cov: 0.1
-    # gyr_cov: 0.1
-    # b_acc_cov: 0.0001
-    # b_gyr_cov: 0.0001
-    acc_cov: 4.61741e-03 # *100
-    gyr_cov: 8.53001e-06 # *10
-    b_acc_cov: 8.44735e-08
-    b_gyr_cov: 5.74410e-12
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
     fov_degree:    360
     det_range:     100.0
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic,
     # 从 LiDAR 到 IMU 的坐标变换
-    extrinsic_T: [ 0.038549, 0.048077, 0.141315 ]
-    extrinsic_R: [ 0.999717,  0.008665, -0.022155,
-               -0.008814, 0.999939,  -0.006658,
-              0.022096, 0.006851, 0.999733 ]
+    # 240910手动标定参数
+    extrinsic_T: [-0.08019078137763, -0.02550745406746, 0.12670900114931]
+    extrinsic_R: [0.996058880159782, 0.076660373485952, -0.0097827817288, 
+                  -0.026866478560205, 1.004460696081592, -0.022656222716123, 
+                  0.01346481467083, 0.018128668072967, 1.012436167071725]
+ 
 
     # GNSS (antenna) to LiDAR extrinsic
     # keep identity/zero if already pre-aligned in upstream localization frame
@@ -43,7 +41,16 @@ publish:
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
-    accum_map_leaf_size: 0.3     # voxel leaf size for /accumulated_map_points (m)
+    accum_map_leaf_size: 0.3     # compatibility default for /accumulated_map_points (m)
+    accum_map_pub_hz: 5.0        # async publish rate for /accumulated_map_points
+    accum_map_forward_range: 10.0
+    accum_map_backward_range: 10.0
+    accum_map_side_range: 10.0
+    accum_map_z_range: 3.0
+    accum_map_front_leaf_size: 0.1
+    accum_map_rear_leaf_size: 0.3
+    accum_map_degraded_leaf_size: 0.3
+    accum_map_max_points: 250000
 
 pcd_save:
     pcd_save_en: false
@@ -117,6 +124,14 @@ runtime_health:
     # Optional CSV used by scripts/calibrate_runtime_health.py.
     # Leave empty in production to avoid per-frame file IO.
     metrics_log_path: ""
+
+calibration_status:
+    enable: false
+    topic: "/fast_lio_sam/calibration_status"
+    publish_period: 1.0
+    stability_window_sec: 10.0
+    # Optional CSV for online extrinsic selection. Override from launch for batch tests.
+    log_path: ""
 
 # Visualization
 globalMapVisualizationSearchRadius: 100.0    # meters, global map visualization radius,  iktree submap 的搜索范围

@@ -34,6 +34,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <math.h>
 #include <algorithm>
 #include <cctype>
@@ -60,6 +62,9 @@
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
 #include <livox_ros_driver2/CustomMsg.h>
+#include <diagnostic_msgs/DiagnosticArray.h>
+#include <diagnostic_msgs/KeyValue.h>
+#include <diagnostic_msgs/DiagnosticStatus.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -192,6 +197,601 @@ geometry_msgs::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+struct RuntimeHealthConfig
+{
+    bool enable = true;
+    string topic = "/fast_lio_sam/runtime_health_alert";
+    double repeat_active_alert_sec = 5.0;
+    int bad_window_frames = 5;
+    int recover_window_frames = 10;
+    int min_effective_feature_num = 30;
+    double min_effective_feature_ratio = 0.05;
+    double critical_effective_feature_ratio = 0.01;
+    double max_residual_mean_warn = 0.12;
+    double max_residual_mean_error = 0.20;
+    double max_frame_translation = 2.0;
+    double max_frame_yaw = 0.8;
+    double max_implied_speed = 8.0;
+    int flicker_window_frames = 6;
+    double rollback_distance = 0.5;
+    double loop_correction_grace_sec = 2.0;
+    string metrics_log_path = "";
+};
+
+struct RuntimeHealthPoseSample
+{
+    double stamp = 0.0;
+    Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+    double yaw = 0.0;
+};
+
+struct RuntimeHealthMetrics
+{
+    double stamp = 0.0;
+    int effective_feature_num = 0;
+    int feats_down_size = 0;
+    double effective_feature_ratio = 0.0;
+    double residual_mean = 0.0;
+    double delta_translation = 0.0;
+    double delta_yaw = 0.0;
+    double implied_speed = 0.0;
+    double pose_cov_trace_xyz = 0.0;
+    double pose_cov_max_xyz = 0.0;
+    bool loop_correction_active = false;
+};
+
+static double normalizeAngle(double angle)
+{
+    while (angle > M_PI)
+        angle -= 2.0 * M_PI;
+    while (angle < -M_PI)
+        angle += 2.0 * M_PI;
+    return angle;
+}
+
+static string boolToString(bool value)
+{
+    return value ? "true" : "false";
+}
+
+static string doubleToString(double value, int precision = 6)
+{
+    std::ostringstream oss;
+    oss << fixed << setprecision(precision) << value;
+    return oss.str();
+}
+
+class RuntimeHealthMonitor
+{
+public:
+    void configure(const ros::NodeHandle &nh)
+    {
+        nh.param<bool>("runtime_health/enable", cfg_.enable, true);
+        nh.param<string>("runtime_health/topic", cfg_.topic, string("/fast_lio_sam/runtime_health_alert"));
+        nh.param<double>("runtime_health/repeat_active_alert_sec", cfg_.repeat_active_alert_sec, 5.0);
+        nh.param<int>("runtime_health/bad_window_frames", cfg_.bad_window_frames, 5);
+        nh.param<int>("runtime_health/recover_window_frames", cfg_.recover_window_frames, 10);
+        nh.param<int>("runtime_health/min_effective_feature_num", cfg_.min_effective_feature_num, 30);
+        nh.param<double>("runtime_health/min_effective_feature_ratio", cfg_.min_effective_feature_ratio, 0.05);
+        nh.param<double>("runtime_health/critical_effective_feature_ratio", cfg_.critical_effective_feature_ratio, 0.01);
+        nh.param<double>("runtime_health/max_residual_mean_warn", cfg_.max_residual_mean_warn, 0.12);
+        nh.param<double>("runtime_health/max_residual_mean_error", cfg_.max_residual_mean_error, 0.20);
+        nh.param<double>("runtime_health/max_frame_translation", cfg_.max_frame_translation, 2.0);
+        nh.param<double>("runtime_health/max_frame_yaw", cfg_.max_frame_yaw, 0.8);
+        nh.param<double>("runtime_health/max_implied_speed", cfg_.max_implied_speed, 8.0);
+        nh.param<int>("runtime_health/flicker_window_frames", cfg_.flicker_window_frames, 6);
+        nh.param<double>("runtime_health/rollback_distance", cfg_.rollback_distance, 0.5);
+        nh.param<double>("runtime_health/loop_correction_grace_sec", cfg_.loop_correction_grace_sec, 2.0);
+        nh.param<string>("runtime_health/metrics_log_path", cfg_.metrics_log_path, string(""));
+
+        cfg_.bad_window_frames = std::max(1, cfg_.bad_window_frames);
+        cfg_.recover_window_frames = std::max(1, cfg_.recover_window_frames);
+        cfg_.flicker_window_frames = std::max(3, cfg_.flicker_window_frames);
+
+        if (!cfg_.metrics_log_path.empty())
+        {
+            metrics_log_.open(cfg_.metrics_log_path.c_str(), ios::out);
+            if (metrics_log_)
+            {
+                metrics_log_ << "stamp,effective_feature_num,feats_down_size,effective_feature_ratio,"
+                             << "residual_mean,delta_translation,delta_yaw,implied_speed,"
+                             << "pose_cov_trace_xyz,pose_cov_max_xyz,loop_correction_active\n";
+                metrics_log_.flush();
+            }
+            else
+            {
+                ROS_WARN("runtime_health metrics_log_path cannot be opened: %s", cfg_.metrics_log_path.c_str());
+            }
+        }
+    }
+
+    const string &topic() const { return cfg_.topic; }
+
+    void setPublisher(const ros::Publisher &publisher)
+    {
+        publisher_ = publisher;
+    }
+
+    void reportNoPoint(double stamp, int feats_size, int effective_num, double residual_mean, const string &reason)
+    {
+        RuntimeHealthMetrics metrics;
+        metrics.stamp = stamp;
+        metrics.feats_down_size = feats_size;
+        metrics.effective_feature_num = effective_num;
+        metrics.residual_mean = residual_mean;
+        metrics.effective_feature_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        publishOrUpdate(diagnostic_msgs::DiagnosticStatus::ERROR, reason, metrics, true);
+    }
+
+    void updateWithOdom(const nav_msgs::Odometry &odom, int feats_size, int effective_num, double residual_mean, bool loop_correction_active)
+    {
+        if (!cfg_.enable)
+            return;
+
+        RuntimeHealthMetrics metrics;
+        metrics.stamp = odom.header.stamp.toSec();
+        metrics.feats_down_size = feats_size;
+        metrics.effective_feature_num = effective_num;
+        metrics.residual_mean = residual_mean;
+        metrics.effective_feature_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        metrics.loop_correction_active = loop_correction_active;
+        metrics.pose_cov_trace_xyz = odom.pose.covariance[0] + odom.pose.covariance[7] + odom.pose.covariance[14];
+        metrics.pose_cov_max_xyz = std::max(odom.pose.covariance[0], std::max(odom.pose.covariance[7], odom.pose.covariance[14]));
+
+        RuntimeHealthPoseSample current;
+        current.stamp = metrics.stamp;
+        current.pos = Eigen::Vector3d(odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z);
+        current.yaw = tf::getYaw(odom.pose.pose.orientation);
+
+        if (loop_correction_active)
+            last_loop_correction_time_ = metrics.stamp;
+
+        if (has_last_pose_)
+        {
+            const double dt = current.stamp - last_pose_.stamp;
+            if (dt > 1e-6)
+            {
+                metrics.delta_translation = (current.pos - last_pose_.pos).norm();
+                metrics.delta_yaw = fabs(normalizeAngle(current.yaw - last_pose_.yaw));
+                metrics.implied_speed = metrics.delta_translation / dt;
+            }
+        }
+
+        int level = diagnostic_msgs::DiagnosticStatus::OK;
+        vector<string> reasons;
+        const bool low_feature_num = effective_num < cfg_.min_effective_feature_num;
+        const bool low_feature_ratio = metrics.effective_feature_ratio < cfg_.min_effective_feature_ratio;
+        const bool critical_feature_ratio = metrics.effective_feature_ratio < cfg_.critical_effective_feature_ratio;
+        const bool high_residual_warn = residual_mean > cfg_.max_residual_mean_warn;
+        const bool high_residual_error = residual_mean > cfg_.max_residual_mean_error;
+        const bool in_loop_grace = isInLoopGrace(metrics.stamp);
+
+        if (feats_size < 5)
+        {
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+            reasons.push_back("FEATS_DOWN_TOO_LOW");
+        }
+        if (effective_num < 1)
+        {
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+            reasons.push_back("NO_EFFECTIVE_POINTS");
+        }
+
+        const bool degraded = low_feature_num || low_feature_ratio || high_residual_warn;
+        if (degraded)
+        {
+            bad_frame_count_++;
+            if (low_feature_num)
+                reasons.push_back("LOW_EFFECTIVE_FEATURE_NUM");
+            if (low_feature_ratio)
+                reasons.push_back("LOW_EFFECTIVE_FEATURE_RATIO");
+            if (high_residual_warn)
+                reasons.push_back("HIGH_RESIDUAL");
+        }
+        else
+        {
+            bad_frame_count_ = 0;
+        }
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && level < diagnostic_msgs::DiagnosticStatus::WARN)
+            level = diagnostic_msgs::DiagnosticStatus::WARN;
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && (critical_feature_ratio || high_residual_error || ((low_feature_num || low_feature_ratio) && high_residual_warn)))
+            level = diagnostic_msgs::DiagnosticStatus::ERROR;
+
+        const bool pose_jump = has_last_pose_ &&
+                               (metrics.delta_translation > cfg_.max_frame_translation ||
+                                metrics.delta_yaw > cfg_.max_frame_yaw ||
+                                metrics.implied_speed > cfg_.max_implied_speed);
+        if (pose_jump)
+        {
+            reasons.push_back(in_loop_grace ? "POSE_JUMP_SUPPRESSED_BY_LOOP_CORRECTION" : "POSE_JUMP");
+            if (!in_loop_grace)
+                level = diagnostic_msgs::DiagnosticStatus::ERROR;
+        }
+
+        if (updateFlickerState(current))
+        {
+            reasons.push_back("POSE_FLICKER_OR_ROLLBACK");
+            level = std::max(level, flicker_error_ ? static_cast<int>(diagnostic_msgs::DiagnosticStatus::ERROR)
+                                                   : static_cast<int>(diagnostic_msgs::DiagnosticStatus::WARN));
+        }
+
+        if (bad_frame_count_ >= cfg_.bad_window_frames && high_residual_warn && (low_feature_num || low_feature_ratio) && !in_loop_grace)
+        {
+            reasons.push_back("MAP_OVERLAP_RISK");
+            level = std::max(level, static_cast<int>(diagnostic_msgs::DiagnosticStatus::WARN));
+        }
+
+        logMetrics(metrics);
+        last_pose_ = current;
+        has_last_pose_ = true;
+
+        if (reasons.empty())
+            reasons.push_back("OK");
+        publishOrUpdate(level, joinReasons(reasons), metrics, false);
+    }
+
+private:
+    bool isInLoopGrace(double stamp) const
+    {
+        return last_loop_correction_time_ > 0.0 && (stamp - last_loop_correction_time_) <= cfg_.loop_correction_grace_sec;
+    }
+
+    bool updateFlickerState(const RuntimeHealthPoseSample &current)
+    {
+        pose_window_.push_back(current);
+        while (static_cast<int>(pose_window_.size()) > cfg_.flicker_window_frames)
+            pose_window_.pop_front();
+
+        flicker_error_ = false;
+        if (pose_window_.size() < 3)
+            return false;
+
+        int flips = 0;
+        for (size_t i = 2; i < pose_window_.size(); ++i)
+        {
+            Eigen::Vector3d prev = pose_window_[i - 1].pos - pose_window_[i - 2].pos;
+            Eigen::Vector3d curr = pose_window_[i].pos - pose_window_[i - 1].pos;
+            const double prev_norm = prev.norm();
+            const double curr_norm = curr.norm();
+            if (prev_norm < cfg_.rollback_distance || curr_norm < cfg_.rollback_distance)
+                continue;
+            const double cos_angle = prev.dot(curr) / (prev_norm * curr_norm);
+            if (cos_angle < -0.5)
+                flips++;
+        }
+
+        if (flips <= 0)
+            return false;
+
+        flicker_error_ = flips >= 2;
+        return true;
+    }
+
+    void publishOrUpdate(int level, const string &reason, const RuntimeHealthMetrics &metrics, bool immediate)
+    {
+        if (!cfg_.enable || publisher_.getTopic().empty())
+            return;
+
+        const double now = metrics.stamp > 0.0 ? metrics.stamp : ros::Time::now().toSec();
+        if (level == diagnostic_msgs::DiagnosticStatus::OK)
+        {
+            bad_recover_count_++;
+            if (last_level_ == diagnostic_msgs::DiagnosticStatus::OK || bad_recover_count_ < cfg_.recover_window_frames)
+                return;
+            publishStatus(diagnostic_msgs::DiagnosticStatus::OK, "RECOVER", reason, metrics);
+            last_level_ = diagnostic_msgs::DiagnosticStatus::OK;
+            last_publish_time_ = now;
+            return;
+        }
+
+        bad_recover_count_ = 0;
+        const bool first_alarm = last_level_ == diagnostic_msgs::DiagnosticStatus::OK;
+        const bool upgrade = level > last_level_;
+        const bool repeat = last_publish_time_ <= 0.0 || (now - last_publish_time_) >= cfg_.repeat_active_alert_sec;
+        if (!immediate && !first_alarm && !upgrade && !repeat)
+        {
+            last_level_ = std::max(last_level_, level);
+            return;
+        }
+
+        const string action = first_alarm ? "TRIGGER" : (upgrade ? "UPGRADE" : "REPEAT");
+        publishStatus(level, action, reason, metrics);
+        last_level_ = std::max(last_level_, level);
+        last_publish_time_ = now;
+    }
+
+    void publishStatus(int level, const string &action, const string &reason, const RuntimeHealthMetrics &metrics)
+    {
+        diagnostic_msgs::DiagnosticArray array_msg;
+        array_msg.header.stamp = metrics.stamp > 0.0 ? ros::Time().fromSec(metrics.stamp) : ros::Time::now();
+        array_msg.header.frame_id = "camera_init";
+
+        diagnostic_msgs::DiagnosticStatus status;
+        status.level = level;
+        status.name = "fast_lio_sam/runtime_health";
+        status.hardware_id = "fast_lio_sam_mapping";
+        status.message = action + ": " + reason;
+        addValue(status, "schema_version", "1");
+        addValue(status, "event_action", action);
+        addValue(status, "reason_flags", reason);
+        addValue(status, "effective_feature_num", std::to_string(metrics.effective_feature_num));
+        addValue(status, "feats_down_size", std::to_string(metrics.feats_down_size));
+        addValue(status, "effective_feature_ratio", doubleToString(metrics.effective_feature_ratio));
+        addValue(status, "residual_mean", doubleToString(metrics.residual_mean));
+        addValue(status, "delta_translation", doubleToString(metrics.delta_translation));
+        addValue(status, "delta_yaw", doubleToString(metrics.delta_yaw));
+        addValue(status, "implied_speed", doubleToString(metrics.implied_speed));
+        addValue(status, "pose_cov_trace_xyz", doubleToString(metrics.pose_cov_trace_xyz));
+        addValue(status, "pose_cov_max_xyz", doubleToString(metrics.pose_cov_max_xyz));
+        addValue(status, "loop_correction_active", boolToString(metrics.loop_correction_active));
+        addValue(status, "bad_frame_count", std::to_string(bad_frame_count_));
+        addValue(status, "thresholds",
+                 "min_feat=" + std::to_string(cfg_.min_effective_feature_num) +
+                     ",min_ratio=" + doubleToString(cfg_.min_effective_feature_ratio) +
+                     ",crit_ratio=" + doubleToString(cfg_.critical_effective_feature_ratio) +
+                     ",res_warn=" + doubleToString(cfg_.max_residual_mean_warn) +
+                     ",res_error=" + doubleToString(cfg_.max_residual_mean_error));
+
+        array_msg.status.push_back(status);
+        publisher_.publish(array_msg);
+    }
+
+    void addValue(diagnostic_msgs::DiagnosticStatus &status, const string &key, const string &value)
+    {
+        diagnostic_msgs::KeyValue item;
+        item.key = key;
+        item.value = value;
+        status.values.push_back(item);
+    }
+
+    string joinReasons(const vector<string> &reasons) const
+    {
+        string joined;
+        for (size_t i = 0; i < reasons.size(); ++i)
+        {
+            if (i > 0)
+                joined += "|";
+            joined += reasons[i];
+        }
+        return joined;
+    }
+
+    void logMetrics(const RuntimeHealthMetrics &metrics)
+    {
+        if (!metrics_log_)
+            return;
+        metrics_log_ << fixed << setprecision(6)
+                     << metrics.stamp << ","
+                     << metrics.effective_feature_num << ","
+                     << metrics.feats_down_size << ","
+                     << metrics.effective_feature_ratio << ","
+                     << metrics.residual_mean << ","
+                     << metrics.delta_translation << ","
+                     << metrics.delta_yaw << ","
+                     << metrics.implied_speed << ","
+                     << metrics.pose_cov_trace_xyz << ","
+                     << metrics.pose_cov_max_xyz << ","
+                     << (metrics.loop_correction_active ? 1 : 0) << "\n";
+        metrics_log_.flush();
+    }
+
+    RuntimeHealthConfig cfg_;
+    ros::Publisher publisher_;
+    ofstream metrics_log_;
+    RuntimeHealthPoseSample last_pose_;
+    bool has_last_pose_ = false;
+    deque<RuntimeHealthPoseSample> pose_window_;
+    int bad_frame_count_ = 0;
+    int bad_recover_count_ = 0;
+    int last_level_ = diagnostic_msgs::DiagnosticStatus::OK;
+    double last_publish_time_ = 0.0;
+    double last_loop_correction_time_ = -1.0;
+    bool flicker_error_ = false;
+};
+
+RuntimeHealthMonitor runtime_health_monitor;
+
+struct CalibrationStatusConfig
+{
+    bool enable = false;
+    string topic = "/fast_lio_sam/calibration_status";
+    string log_path = "";
+    double publish_period = 1.0;
+    double stability_window_sec = 10.0;
+};
+
+struct CalibrationStatusSample
+{
+    double stamp = 0.0;
+    Eigen::Vector3d ext_rpy_deg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d ext_t = Eigen::Vector3d::Zero();
+};
+
+class CalibrationStatusMonitor
+{
+public:
+    void configure(const ros::NodeHandle &nh)
+    {
+        nh.param<bool>("calibration_status/enable", cfg_.enable, false);
+        nh.param<string>("calibration_status/topic", cfg_.topic, string("/fast_lio_sam/calibration_status"));
+        nh.param<string>("calibration_status/log_path", cfg_.log_path, string(""));
+        nh.param<double>("calibration_status/publish_period", cfg_.publish_period, 1.0);
+        nh.param<double>("calibration_status/stability_window_sec", cfg_.stability_window_sec, 10.0);
+
+        cfg_.publish_period = std::max(0.1, cfg_.publish_period);
+        cfg_.stability_window_sec = std::max(1.0, cfg_.stability_window_sec);
+
+        if (!cfg_.log_path.empty())
+        {
+            log_.open(cfg_.log_path.c_str(), ios::out);
+            if (log_)
+            {
+                log_ << "stamp,relative_time,time_diff_lidar_wrt_imu,"
+                     << "ext_roll_deg,ext_pitch_deg,ext_yaw_deg,ext_x,ext_y,ext_z,"
+                     << "ext_roll_sigma_deg,ext_pitch_sigma_deg,ext_yaw_sigma_deg,"
+                     << "ext_x_sigma,ext_y_sigma,ext_z_sigma,"
+                     << "window_rot_drift_deg,window_trans_drift,"
+                     << "effective_feature_num,feats_down_size,effective_feature_ratio,residual_mean\n";
+                log_.flush();
+            }
+            else
+            {
+                ROS_WARN("calibration_status log_path cannot be opened: %s", cfg_.log_path.c_str());
+            }
+        }
+    }
+
+    const string &topic() const { return cfg_.topic; }
+
+    void setPublisher(const ros::Publisher &publisher)
+    {
+        publisher_ = publisher;
+    }
+
+    void update(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                const state_ikfom &state, const esekfom::esekf<state_ikfom, 12, input_ikfom>::cov &P,
+                int effective_num, int feats_size, double residual_mean)
+    {
+        if (!cfg_.enable)
+            return;
+
+        CalibrationStatusSample sample;
+        sample.stamp = stamp;
+        vect3 ext_euler = SO3ToEuler(state.offset_R_L_I);
+        sample.ext_rpy_deg = Eigen::Vector3d(ext_euler(0), ext_euler(1), ext_euler(2));
+        sample.ext_t = Eigen::Vector3d(state.offset_T_L_I(0), state.offset_T_L_I(1), state.offset_T_L_I(2));
+        samples_.push_back(sample);
+        while (!samples_.empty() && stamp - samples_.front().stamp > cfg_.stability_window_sec)
+            samples_.pop_front();
+
+        const double effective_ratio = feats_size > 0 ? static_cast<double>(effective_num) / static_cast<double>(feats_size) : 0.0;
+        const Eigen::Vector3d ext_rot_sigma_deg(safeSigma(P(6, 6)) * 57.3,
+                                                safeSigma(P(7, 7)) * 57.3,
+                                                safeSigma(P(8, 8)) * 57.3);
+        const Eigen::Vector3d ext_t_sigma(safeSigma(P(9, 9)),
+                                          safeSigma(P(10, 10)),
+                                          safeSigma(P(11, 11)));
+
+        double window_rot_drift_deg = 0.0;
+        double window_trans_drift = 0.0;
+        if (!samples_.empty())
+        {
+            window_rot_drift_deg = (sample.ext_rpy_deg - samples_.front().ext_rpy_deg).norm();
+            window_trans_drift = (sample.ext_t - samples_.front().ext_t).norm();
+        }
+
+        logCsv(stamp, relative_time, timediff_lidar_wrt_imu, sample, ext_rot_sigma_deg, ext_t_sigma,
+               window_rot_drift_deg, window_trans_drift, effective_num, feats_size, effective_ratio, residual_mean);
+
+        if (stamp - last_publish_stamp_ < cfg_.publish_period)
+            return;
+
+        last_publish_stamp_ = stamp;
+        publishStatus(stamp, relative_time, timediff_lidar_wrt_imu, sample, ext_rot_sigma_deg, ext_t_sigma,
+                      window_rot_drift_deg, window_trans_drift, effective_num, feats_size, effective_ratio, residual_mean);
+    }
+
+private:
+    double safeSigma(double variance) const
+    {
+        return variance > 0.0 && std::isfinite(variance) ? std::sqrt(variance) : 0.0;
+    }
+
+    void addValue(diagnostic_msgs::DiagnosticStatus &status, const string &key, const string &value)
+    {
+        diagnostic_msgs::KeyValue item;
+        item.key = key;
+        item.value = value;
+        status.values.push_back(item);
+    }
+
+    void logCsv(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                const CalibrationStatusSample &sample, const Eigen::Vector3d &ext_rot_sigma_deg,
+                const Eigen::Vector3d &ext_t_sigma, double window_rot_drift_deg, double window_trans_drift,
+                int effective_num, int feats_size, double effective_ratio, double residual_mean)
+    {
+        if (!log_)
+            return;
+
+        log_ << fixed << setprecision(9)
+             << stamp << ","
+             << relative_time << ","
+             << timediff_lidar_wrt_imu << ","
+             << sample.ext_rpy_deg(0) << ","
+             << sample.ext_rpy_deg(1) << ","
+             << sample.ext_rpy_deg(2) << ","
+             << sample.ext_t(0) << ","
+             << sample.ext_t(1) << ","
+             << sample.ext_t(2) << ","
+             << ext_rot_sigma_deg(0) << ","
+             << ext_rot_sigma_deg(1) << ","
+             << ext_rot_sigma_deg(2) << ","
+             << ext_t_sigma(0) << ","
+             << ext_t_sigma(1) << ","
+             << ext_t_sigma(2) << ","
+             << window_rot_drift_deg << ","
+             << window_trans_drift << ","
+             << effective_num << ","
+             << feats_size << ","
+             << effective_ratio << ","
+             << residual_mean << "\n";
+        log_.flush();
+    }
+
+    void publishStatus(double stamp, double relative_time, double timediff_lidar_wrt_imu,
+                       const CalibrationStatusSample &sample, const Eigen::Vector3d &ext_rot_sigma_deg,
+                       const Eigen::Vector3d &ext_t_sigma, double window_rot_drift_deg, double window_trans_drift,
+                       int effective_num, int feats_size, double effective_ratio, double residual_mean)
+    {
+        if (publisher_.getTopic().empty())
+            return;
+
+        diagnostic_msgs::DiagnosticArray array_msg;
+        array_msg.header.stamp = stamp > 0.0 ? ros::Time().fromSec(stamp) : ros::Time::now();
+        array_msg.header.frame_id = "body";
+
+        diagnostic_msgs::DiagnosticStatus status;
+        status.level = diagnostic_msgs::DiagnosticStatus::OK;
+        status.name = "fast_lio_sam/calibration_status";
+        status.hardware_id = "fast_lio_sam_mapping";
+        status.message = "ONLINE_EXTRINSIC_STATUS";
+        addValue(status, "schema_version", "1");
+        addValue(status, "relative_time", doubleToString(relative_time, 6));
+        addValue(status, "time_diff_lidar_wrt_imu", doubleToString(timediff_lidar_wrt_imu, 9));
+        addValue(status, "ext_rpy_deg", doubleToString(sample.ext_rpy_deg(0), 9) + "," +
+                                         doubleToString(sample.ext_rpy_deg(1), 9) + "," +
+                                         doubleToString(sample.ext_rpy_deg(2), 9));
+        addValue(status, "ext_t", doubleToString(sample.ext_t(0), 9) + "," +
+                                  doubleToString(sample.ext_t(1), 9) + "," +
+                                  doubleToString(sample.ext_t(2), 9));
+        addValue(status, "ext_rpy_sigma_deg", doubleToString(ext_rot_sigma_deg(0), 9) + "," +
+                                               doubleToString(ext_rot_sigma_deg(1), 9) + "," +
+                                               doubleToString(ext_rot_sigma_deg(2), 9));
+        addValue(status, "ext_t_sigma", doubleToString(ext_t_sigma(0), 9) + "," +
+                                        doubleToString(ext_t_sigma(1), 9) + "," +
+                                        doubleToString(ext_t_sigma(2), 9));
+        addValue(status, "window_rot_drift_deg", doubleToString(window_rot_drift_deg, 9));
+        addValue(status, "window_trans_drift", doubleToString(window_trans_drift, 9));
+        addValue(status, "effective_feature_num", std::to_string(effective_num));
+        addValue(status, "feats_down_size", std::to_string(feats_size));
+        addValue(status, "effective_feature_ratio", doubleToString(effective_ratio, 9));
+        addValue(status, "residual_mean", doubleToString(residual_mean, 9));
+
+        array_msg.status.push_back(status);
+        publisher_.publish(array_msg);
+    }
+
+    CalibrationStatusConfig cfg_;
+    ros::Publisher publisher_;
+    ofstream log_;
+    deque<CalibrationStatusSample> samples_;
+    double last_publish_stamp_ = -std::numeric_limits<double>::infinity();
+};
+
+CalibrationStatusMonitor calibration_status_monitor;
+
 /*back end*/
 vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样）
 vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;   // 历史所有关键帧的平面点集合（降采样）
@@ -279,6 +879,31 @@ Eigen::MatrixXd poseCovariance;
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap ;           //   发布最后优化的地图
 ros::Publisher pubAccumulatedMap;                //   发布累积降采样点云（body系）
+
+struct AccumulatedMapFrame
+{
+    PointCloudXYZI::Ptr cloud_body;
+    M3D rot;
+    V3D pos;
+    M3D offset_R_L_I;
+    V3D offset_T_L_I;
+    double stamp;
+};
+
+mutex mtx_accumulated_map;
+condition_variable sig_accumulated_map;
+deque<AccumulatedMapFrame> accumulated_map_frame_queue;
+PointCloudXYZI::Ptr accumulated_map_world_cache(new PointCloudXYZI());
+bool accumulated_map_thread_exit = false;
+float accum_map_pub_hz = 5.0f;
+float accum_map_forward_range = 10.0f;
+float accum_map_backward_range = 10.0f;
+float accum_map_side_range = 10.0f;
+float accum_map_z_range = 3.0f;
+float accum_map_front_leaf_size = 0.1f;
+float accum_map_rear_leaf_size = 0.3f;
+float accum_map_degraded_leaf_size = 0.3f;
+int accum_map_max_points = 250000;
 
 bool    recontructKdTree = false;
 int updateKdtreeCount = 0 ;        //  每100次更新一次
@@ -1185,9 +1810,9 @@ void loopClosureThread()
 
 void SigHandle(int sig)
 {
+    (void)sig;
     flg_exit = true;
-    ROS_WARN("catch sig %d", sig);
-    sig_buffer.notify_all();
+    ros::shutdown();
 }
 
 inline void dump_lio_state_to_log(FILE *fp)
@@ -1771,8 +2396,170 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+
+PointType transformAccumPointBodyToWorld(const PointType &point_body, const AccumulatedMapFrame &frame)
+{
+    V3D p_body(point_body.x, point_body.y, point_body.z);
+    V3D p_world(frame.rot * (frame.offset_R_L_I * p_body + frame.offset_T_L_I) + frame.pos);
+
+    PointType point_world;
+    point_world.x = p_world(0);
+    point_world.y = p_world(1);
+    point_world.z = p_world(2);
+    point_world.intensity = point_body.intensity;
+    return point_world;
+}
+
+PointType transformAccumPointWorldToBody(const PointType &point_world, const M3D &rot, const V3D &pos)
+{
+    V3D p_body = rot.transpose() * (V3D(point_world.x, point_world.y, point_world.z) - pos);
+
+    PointType point_body;
+    point_body.x = p_body(0);
+    point_body.y = p_body(1);
+    point_body.z = p_body(2);
+    point_body.intensity = point_world.intensity;
+    return point_body;
+}
+
+void downsampleAccumulatedCloud(const PointCloudXYZI::Ptr &cloud_in, float leaf_size, PointCloudXYZI::Ptr &cloud_out)
+{
+    pcl::VoxelGrid<PointType> filter;
+    filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+    filter.setInputCloud(cloud_in);
+    filter.filter(*cloud_out);
+}
+
+void publishAccumulatedMapThread()
+{
+    ros::WallDuration publish_period(1.0 / std::max(0.1f, accum_map_pub_hz));
+
+    while (ros::ok())
+    {
+        deque<AccumulatedMapFrame> local_frames;
+        {
+            unique_lock<mutex> lock(mtx_accumulated_map);
+            sig_accumulated_map.wait_for(lock, std::chrono::milliseconds(20), [] {
+                return accumulated_map_thread_exit || !accumulated_map_frame_queue.empty();
+            });
+
+            if (accumulated_map_thread_exit)
+                break;
+
+            accumulated_map_frame_queue.swap(local_frames);
+        }
+
+        if (pubAccumulatedMap.getNumSubscribers() == 0)
+        {
+            accumulated_map_world_cache->clear();
+            publish_period.sleep();
+            continue;
+        }
+
+        if (local_frames.empty())
+        {
+            publish_period.sleep();
+            continue;
+        }
+
+        AccumulatedMapFrame latest_frame = local_frames.back();
+        for (const auto &frame : local_frames)
+        {
+            PointCloudXYZI::Ptr cloud_world(new PointCloudXYZI());
+            cloud_world->resize(frame.cloud_body->size());
+            for (size_t i = 0; i < frame.cloud_body->size(); ++i)
+                cloud_world->points[i] = transformAccumPointBodyToWorld(frame.cloud_body->points[i], frame);
+            *accumulated_map_world_cache += *cloud_world;
+        }
+
+        M3D rot_inv = latest_frame.rot.transpose();
+        PointCloudXYZI::Ptr cropped_world(new PointCloudXYZI());
+        PointCloudXYZI::Ptr front_body(new PointCloudXYZI());
+        PointCloudXYZI::Ptr rear_body(new PointCloudXYZI());
+        cropped_world->reserve(accumulated_map_world_cache->size());
+        front_body->reserve(accumulated_map_world_cache->size());
+        rear_body->reserve(accumulated_map_world_cache->size());
+
+        for (const auto &point_world : accumulated_map_world_cache->points)
+        {
+            V3D p_body_vec = rot_inv * (V3D(point_world.x, point_world.y, point_world.z) - latest_frame.pos);
+            if (p_body_vec(0) < -accum_map_backward_range || p_body_vec(0) > accum_map_forward_range ||
+                fabs(p_body_vec(1)) > accum_map_side_range || fabs(p_body_vec(2)) > accum_map_z_range)
+            {
+                continue;
+            }
+
+            cropped_world->push_back(point_world);
+            PointType point_body;
+            point_body.x = p_body_vec(0);
+            point_body.y = p_body_vec(1);
+            point_body.z = p_body_vec(2);
+            point_body.intensity = point_world.intensity;
+
+            if (p_body_vec(0) >= 0.0)
+                front_body->push_back(point_body);
+            else
+                rear_body->push_back(point_body);
+        }
+
+        accumulated_map_world_cache->swap(*cropped_world);
+
+        PointCloudXYZI::Ptr front_ds(new PointCloudXYZI());
+        PointCloudXYZI::Ptr rear_ds(new PointCloudXYZI());
+        downsampleAccumulatedCloud(front_body, accum_map_front_leaf_size, front_ds);
+        downsampleAccumulatedCloud(rear_body, accum_map_rear_leaf_size, rear_ds);
+
+        PointCloudXYZI::Ptr publish_body(new PointCloudXYZI());
+        *publish_body += *front_ds;
+        *publish_body += *rear_ds;
+
+        if (accum_map_max_points > 0 && publish_body->size() > static_cast<size_t>(accum_map_max_points))
+        {
+            PointCloudXYZI::Ptr all_body(new PointCloudXYZI());
+            all_body->reserve(accumulated_map_world_cache->size());
+            for (const auto &point_world : accumulated_map_world_cache->points)
+                all_body->push_back(transformAccumPointWorldToBody(point_world, latest_frame.rot, latest_frame.pos));
+
+            publish_body.reset(new PointCloudXYZI());
+            downsampleAccumulatedCloud(all_body, accum_map_degraded_leaf_size, publish_body);
+            ROS_WARN_THROTTLE(5.0, "/accumulated_map_points degraded to %.2fm leaf: %zu points over limit %d",
+                              accum_map_degraded_leaf_size, publish_body->size(), accum_map_max_points);
+        }
+
+        sensor_msgs::PointCloud2 accumulatedMapMsg;
+        pcl::toROSMsg(*publish_body, accumulatedMapMsg);
+        accumulatedMapMsg.header.stamp = ros::Time().fromSec(latest_frame.stamp);
+        accumulatedMapMsg.header.frame_id = "body";
+        pubAccumulatedMap.publish(accumulatedMapMsg);
+
+        publish_period.sleep();
+    }
+}
+
+void queueAccumulatedMapFrame()
+{
+    if (pubAccumulatedMap.getNumSubscribers() == 0)
+        return;
+
+    AccumulatedMapFrame frame;
+    frame.cloud_body.reset(new PointCloudXYZI(*feats_undistort));
+    frame.rot = state_point.rot.toRotationMatrix();
+    frame.pos = state_point.pos;
+    frame.offset_R_L_I = state_point.offset_R_L_I;
+    frame.offset_T_L_I = state_point.offset_T_L_I;
+    frame.stamp = lidar_end_time;
+
+    {
+        lock_guard<mutex> lock(mtx_accumulated_map);
+        accumulated_map_frame_queue.push_back(frame);
+        const size_t max_pending_frames = static_cast<size_t>(std::max(1.0f, accum_map_pub_hz * 2.0f));
+        while (accumulated_map_frame_queue.size() > max_pending_frames)
+            accumulated_map_frame_queue.pop_front();
+    }
+    sig_accumulated_map.notify_one();
+}
+
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    将稠密点云从 imu convert to  world
 {
     if (scan_pub_en)
@@ -1797,68 +2584,7 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
     }
 
     if (pubAccumulatedMap.getNumSubscribers() > 0)
-    {
-        int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i],
-                                &laserCloudWorld->points[i]);
-        }
-        *pcl_wait_pub += *laserCloudWorld;
-
-        // 1. VoxelGrid 降采样（1.0m 体素，比原 0.25m 稀疏 64 倍）
-        static pcl::VoxelGrid<PointType> downSizeFilterAccumulated;
-        static bool accumulated_filter_initialized = false;
-        if (!accumulated_filter_initialized)
-        {
-            constexpr float accumulated_leaf_size = 1.0f;
-            downSizeFilterAccumulated.setLeafSize(accumulated_leaf_size, accumulated_leaf_size, accumulated_leaf_size);
-            accumulated_filter_initialized = true;
-        }
-
-        PointCloudXYZI::Ptr accumulatedCloudDS(new PointCloudXYZI());
-        downSizeFilterAccumulated.setInputCloud(pcl_wait_pub);
-        downSizeFilterAccumulated.filter(*accumulatedCloudDS);
-
-        // 2. CropBox：仅保留当前位置 ±20m 范围内的点（world 系），使点云规模与行驶距离无关
-        constexpr float ACCUM_MAP_RADIUS = 20.0f;
-        const V3D &cur_pos = state_point.pos;
-        pcl::CropBox<PointType> cropBox;
-        cropBox.setMin(Eigen::Vector4f(cur_pos(0) - ACCUM_MAP_RADIUS,
-                                       cur_pos(1) - ACCUM_MAP_RADIUS,
-                                       cur_pos(2) - ACCUM_MAP_RADIUS, 1.0f));
-        cropBox.setMax(Eigen::Vector4f(cur_pos(0) + ACCUM_MAP_RADIUS,
-                                       cur_pos(1) + ACCUM_MAP_RADIUS,
-                                       cur_pos(2) + ACCUM_MAP_RADIUS, 1.0f));
-        cropBox.setInputCloud(accumulatedCloudDS);
-        PointCloudXYZI::Ptr accumulatedCloudCropped(new PointCloudXYZI());
-        cropBox.filter(*accumulatedCloudCropped);
-
-        // 3. 转换到 body 系发布
-        M3D rot_inv = state_point.rot.toRotationMatrix().transpose();
-        V3D trans_inv = -rot_inv * cur_pos;
-        PointCloudXYZI::Ptr accumulatedCloudBody(new PointCloudXYZI(accumulatedCloudCropped->size(), 1));
-        for (size_t i = 0; i < accumulatedCloudCropped->size(); i++)
-        {
-            const PointType &point_world = accumulatedCloudCropped->points[i];
-            V3D p_body = rot_inv * V3D(point_world.x, point_world.y, point_world.z) + trans_inv;
-            PointType &point_body = accumulatedCloudBody->points[i];
-            point_body.x = p_body(0);
-            point_body.y = p_body(1);
-            point_body.z = p_body(2);
-            point_body.intensity = point_world.intensity;
-        }
-
-        sensor_msgs::PointCloud2 accumulatedMapMsg;
-        pcl::toROSMsg(*accumulatedCloudBody, accumulatedMapMsg);
-        accumulatedMapMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        accumulatedMapMsg.header.frame_id = "body";
-        pubAccumulatedMap.publish(accumulatedMapMsg);
-
-        // 4. 裁剪后的点云回写缓存（同时淘汰远距离历史点，使 pcl_wait_pub 规模有界）
-        pcl_wait_pub->swap(*accumulatedCloudCropped);
-    }
+        queueAccumulatedMapFrame();
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
@@ -2390,6 +3116,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
+        runtime_health_monitor.reportNoPoint(lidar_end_time, feats_down_size, effct_feat_num, res_mean_last, "NO_EFFECTIVE_POINTS");
         ROS_WARN("No Effective Points! \n");
         return;
     }
@@ -2453,6 +3180,17 @@ int main(int argc, char **argv)
     nh.param<bool>("publish/scan_publish_en", scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en", dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, true);
+    float accum_map_leaf_size;
+    nh.param<float>("publish/accum_map_leaf_size", accum_map_leaf_size, 0.3f);
+    nh.param<float>("publish/accum_map_pub_hz", accum_map_pub_hz, 5.0f);
+    nh.param<float>("publish/accum_map_forward_range", accum_map_forward_range, 10.0f);
+    nh.param<float>("publish/accum_map_backward_range", accum_map_backward_range, 10.0f);
+    nh.param<float>("publish/accum_map_side_range", accum_map_side_range, 10.0f);
+    nh.param<float>("publish/accum_map_z_range", accum_map_z_range, 3.0f);
+    nh.param<float>("publish/accum_map_front_leaf_size", accum_map_front_leaf_size, 0.1f);
+    nh.param<float>("publish/accum_map_rear_leaf_size", accum_map_rear_leaf_size, accum_map_leaf_size);
+    nh.param<float>("publish/accum_map_degraded_leaf_size", accum_map_degraded_leaf_size, accum_map_leaf_size);
+    nh.param<int>("publish/accum_map_max_points", accum_map_max_points, 250000);
     nh.param<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
     nh.param<string>("map_file_path", map_file_path, "");
     nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
@@ -2480,6 +3218,8 @@ int main(int argc, char **argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    runtime_health_monitor.configure(nh);
+    calibration_status_monitor.configure(nh);
     cout << "p_pre->lidar_type " << p_pre->lidar_type << endl;
 
     nh.param<float>("odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
@@ -2627,18 +3367,30 @@ int main(int argc, char **argv)
         cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
 
     /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
-    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);        //  world系下稠密点云
-    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);      //  body系下稠密点云
-    pubAccumulatedMap = nh.advertise<sensor_msgs::PointCloud2>("/accumulated_map_points", 10);
-    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100000);         //  no used
-    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100000);                    //  no used
-    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
-    ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 1e00000);
+    const int kLidarSubQueueSize = 2000;
+    const int kImuSubQueueSize = 2000;
+    const int kGnssSubQueueSize = 200;
+    const int kPointCloudPubQueueSize = 2;
+    const int kAccumulatedMapPubQueueSize = 2;
+    const int kOdomPubQueueSize = 100;
+    const int kPathPubQueueSize = 10;
 
-    ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
-    pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
+    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, kLidarSubQueueSize, livox_pcl_cbk) : nh.subscribe(lid_topic, kLidarSubQueueSize, standard_pcl_cbk);
+    ros::Subscriber sub_imu = nh.subscribe(imu_topic, kImuSubQueueSize, imu_cbk);
+    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", kPointCloudPubQueueSize);        //  world系下稠密点云
+    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", kPointCloudPubQueueSize);      //  body系下稠密点云
+    pubAccumulatedMap = nh.advertise<sensor_msgs::PointCloud2>("/accumulated_map_points", kAccumulatedMapPubQueueSize);
+    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", kPointCloudPubQueueSize);         //  no used
+    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", kPointCloudPubQueueSize);                    //  no used
+    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/Odometry", kOdomPubQueueSize);
+    ros::Publisher pubRuntimeHealth = nh.advertise<diagnostic_msgs::DiagnosticArray>(runtime_health_monitor.topic(), 10);
+    runtime_health_monitor.setPublisher(pubRuntimeHealth);
+    ros::Publisher pubCalibrationStatus = nh.advertise<diagnostic_msgs::DiagnosticArray>(calibration_status_monitor.topic(), 10);
+    calibration_status_monitor.setPublisher(pubCalibrationStatus);
+    ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", kPathPubQueueSize);
+
+    ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", kPathPubQueueSize);                   //  isam更新后的path
+    pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", kPathPubQueueSize);
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
     pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/map_global_optimized", 1); // 发布局部关键帧map的特征点云
 
@@ -2651,7 +3403,7 @@ int main(int argc, char **argv)
     pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("/fast_lio_sam/mapping/loop_closure_constraints", 1);
 
     // gnss
-    ros::Subscriber sub_gnss = nh.subscribe(gnss_topic, 200000, gnss_cbk);
+    ros::Subscriber sub_gnss = nh.subscribe(gnss_topic, kGnssSubQueueSize, gnss_cbk);
     
     // saveMap  发布地图保存服务
     srvSaveMap  = nh.advertiseService("/save_map" ,  &saveMapService);
@@ -2664,7 +3416,8 @@ int main(int argc, char **argv)
 
     //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
+    thread accumulated_map_thread(publishAccumulatedMapThread);
+    ros::WallRate rate(5000);
     bool status = ros::ok();
     while (status)
     {
@@ -2741,6 +3494,7 @@ int main(int argc, char **argv)
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
+                runtime_health_monitor.reportNoPoint(lidar_end_time, feats_down_size, effct_feat_num, res_mean_last, "FEATS_DOWN_TOO_LOW");
                 ROS_WARN("No point, skip this scan!\n");
                 continue;
             }
@@ -2791,10 +3545,15 @@ int main(int argc, char **argv)
             // 4.得到当前帧优化后的位姿，位姿协方差
             // 5.添加cloudKeyPoses3D，cloudKeyPoses6D，更新transformTobeMapped，添加当前关键帧的角点、平面点集合
             saveKeyFramesAndFactor();
+            bool runtime_health_loop_correction = aLoopIsClosed;
             // 更新因子图中所有变量节点的位姿，也就是所有历史关键帧的位姿，更新里程计轨迹， 重构ikdtree
             correctPoses();
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            runtime_health_monitor.updateWithOdom(odomAftMapped, feats_down_size, effct_feat_num, res_mean_last, runtime_health_loop_correction);
+            calibration_status_monitor.update(lidar_end_time, Measures.lidar_beg_time - first_lidar_time,
+                                              timediff_lidar_wrt_imu, state_point, kf.get_P(),
+                                              effct_feat_num, feats_down_size, res_mean_last);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();
@@ -2892,6 +3651,13 @@ int main(int argc, char **argv)
     }
 
     startFlag = false;
+    {
+        lock_guard<mutex> lock(mtx_accumulated_map);
+        accumulated_map_thread_exit = true;
+    }
+    sig_accumulated_map.notify_all();
+    if (accumulated_map_thread.joinable())
+        accumulated_map_thread.join();
     loopthread.join(); //  分离线程
 
     return 0;

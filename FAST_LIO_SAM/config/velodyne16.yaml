@@ -39,6 +39,7 @@ publish:
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    accum_map_leaf_size: 0.3     # voxel leaf size for /accumulated_map_points (m)
 
 pcd_save:
     pcd_save_en: true
@@ -72,6 +73,27 @@ historyKeyframeSearchRadius: 1.5             # meters, key frame that is within 
 historyKeyframeSearchTimeDiff: 30.0           # seconds, key frame that is n seconds older will be considered for loop closure
 historyKeyframeSearchNum: 20                  # number of hostory key frames will be fused into a submap for loop closure
 historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
+
+runtime_health:
+    enable: true
+    topic: "/fast_lio_sam/runtime_health_alert"
+    repeat_active_alert_sec: 5.0
+    bad_window_frames: 5
+    recover_window_frames: 10
+    min_effective_feature_num: 197
+    min_effective_feature_ratio: 0.109596
+    critical_effective_feature_ratio: 0.027399
+    max_residual_mean_warn: 0.140015
+    max_residual_mean_error: 0.250022
+    max_frame_translation: 0.500000
+    max_frame_yaw: 0.200000
+    max_implied_speed: 4.270483
+    flicker_window_frames: 6
+    rollback_distance: 0.5
+    loop_correction_grace_sec: 2.0
+    # Optional CSV used by scripts/calibrate_runtime_health.py.
+    # Leave empty in production to avoid per-frame file IO.
+    metrics_log_path: ""
 
 # Visualization
 globalMapVisualizationSearchRadius: 1000.0    # meters, global map visualization radius
