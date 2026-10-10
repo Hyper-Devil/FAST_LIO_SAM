@@ -2663,12 +2663,19 @@ void set_posestamp(T &out)
 template <typename T>
 void set_twiststamp(T &out)
 {
-    out.twist.linear.x = state_point.vel(0);
-    out.twist.linear.y = state_point.vel(1);
-    out.twist.linear.z = state_point.vel(2);
+    // state_point.vel is maintained by the filter in camera_init/world axes,
+    // whereas the Odometry twist is expressed in child_frame_id ("body").
+    // Publishing it directly mixes frames and can invert the reported forward
+    // speed when the vehicle heading differs from the world x axis.
+    const M3D R_body_world = state_point.rot.toRotationMatrix().transpose();
+    const V3D velocity_body = R_body_world * state_point.vel;
+    out.twist.linear.x = velocity_body(0);
+    out.twist.linear.y = velocity_body(1);
+    out.twist.linear.z = velocity_body(2);
 
     if (!Measures.imu.empty())
     {
+        // The gyro input is already expressed in FAST-LIO's IMU/body axes.
         out.twist.angular.x = Measures.imu.back()->angular_velocity.x;
         out.twist.angular.y = Measures.imu.back()->angular_velocity.y;
         out.twist.angular.z = Measures.imu.back()->angular_velocity.z;
@@ -2707,11 +2714,15 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
         odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
     }
 
+    // Keep the covariance in the same body axes as the linear twist above.
+    const M3D R_body_world = state_point.rot.toRotationMatrix().transpose();
+    const M3D velocity_covariance_body =
+        R_body_world * P.block<3, 3>(12, 12) * R_body_world.transpose();
     for (int i = 0; i < 3; i++)
     {
         for (int j = 0; j < 3; j++)
         {
-            odomAftMapped.twist.covariance[i * 6 + j] = P(12 + i, 12 + j);
+            odomAftMapped.twist.covariance[i * 6 + j] = velocity_covariance_body(i, j);
         }
     }
     for (int i = 3; i < 6; i++)
